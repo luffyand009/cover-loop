@@ -50,7 +50,7 @@ const ResponseDB = mongoose.model(
 );
 
 // File Path for Pincodes
-const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "CreditSea_latest.xlsx");
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "creditsea_pincode.xlsx");
 
 // Headers
 function getCreateLeadHeaders() {
@@ -77,14 +77,27 @@ function loadValidPincodes() {
     const workbook = xlsx.readFile(PINCODE_FILE_PATH);
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
-    const data = xlsx.utils.sheet_to_json(worksheet, { header: 1 });
+    
+    // Convert sheet to an array of objects using headers
+    const data = xlsx.utils.sheet_to_json(worksheet);
 
     const pincodes = new Set();
+    
     data.forEach((row) => {
-      if (row[0]) {
-        pincodes.add(String(row[0]).trim());
+      // Look for 'pinCode' or common variations (case-insensitive search)
+      const pinKey = Object.keys(row).find(
+        (key) => key.trim().toLowerCase() === 'pincode'
+      );
+
+      if (pinKey && row[pinKey]) {
+        // Clean and format pincode (e.g., handles trailing spaces or numbers)
+        const cleanPin = String(row[pinKey]).trim();
+        if (cleanPin) {
+          pincodes.add(cleanPin);
+        }
       }
     });
+
     console.log(`✅ Loaded ${pincodes.size} valid pincodes from Excel.`);
     return pincodes;
   } catch (error) {
