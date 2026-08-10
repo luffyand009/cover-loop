@@ -1,5 +1,7 @@
 const { MongoClient } = require("mongodb");
 const axios = require("axios");
+const path = require("path");
+const XLSX = require("xlsx"); // 👈 Excel read karne ke liye
 require("dotenv").config();
 
 const MONGO_URI = process.env.MONGO_URI_COVER;
@@ -15,6 +17,41 @@ const USERNAME = "LP_KeshvaCredit";
 const PASSWORD = "Ia0#7264#5";
 const CAMPAIGN_ID = 577759020;
 const LENDER_NAME = "vivifin";
+
+// ------------ LOAD PINCODES FROM EXCEL ------------ //
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "vivi.xlsx"); // Aap apni file ka path yahan adjust kar sakte hain
+
+function loadValidPincodes() {
+  try {
+    const workbook = XLSX.readFile(PINCODE_FILE_PATH);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    
+    const data = XLSX.utils.sheet_to_json(worksheet);
+    const pincodes = new Set();
+    
+    data.forEach((row) => {
+      const pinKey = Object.keys(row).find(
+        (key) => key.trim().toLowerCase() === 'pincode' || key.trim().toLowerCase() === 'pin'
+      );
+
+      if (pinKey && row[pinKey]) {
+        const cleanPin = String(row[pinKey]).trim();
+        if (cleanPin) {
+          pincodes.add(cleanPin);
+        }
+      }
+    });
+
+    console.log(`✅ Loaded ${pincodes.size} valid pincodes from Excel.`);
+    return pincodes;
+  } catch (error) {
+    console.error(`❌ Error loading pincode file: ${error.message}`);
+    return new Set();
+  }
+}
+
+const allowedPincodes = loadValidPincodes();
 
 // ------------ CONTROL ------------ //
 
@@ -68,7 +105,6 @@ function splitName(doc) {
   const first = parts[0] || "NA";
   let last = parts.length > 1 ? parts.slice(1).join(" ") : "";
   
-  // 💡 सुरक्षा घेरा: अगर सिंगल नाम है और कोई सरनेम नहीं मिला, तो "NA" भेजें
   if (!last) {
     last = "NA"; 
   }
@@ -90,7 +126,6 @@ function formatDob(dob) {
   if (typeof dob === "string") {
     dob = dob.trim();
 
-    // ISO string: 1985-02-28T00:00:00.000Z
     if (dob.includes("T")) {
       dob = dob.split("T")[0];
     }
@@ -134,7 +169,7 @@ function mapIncomeType(emp) {
 
 function shouldSkip(lead) {
   // 1. Basic required fields check
-  const required = ["phone", "pan", "dob", "gender", "name"];
+  const required = ["phone", "pan", "dob", "gender", "name", "pincode"];
   for (const field of required) {
     if (!lead[field]) return true;
   }
@@ -148,39 +183,24 @@ function shouldSkip(lead) {
     if (hasAlreadyProcessed) return true;
   }
 
-  // 3. New Validation: Employment must be "salaried" (Case-Insensitive)
+  // 3. Employment must be "salaried" (Case-Insensitive)
   const emp = (lead.employment || "").trim().toLowerCase();
   if (emp !== "salaried") return true;
 
-  // 4. New Validation: Income must be >= 25000 (Parses string correctly)
+  // 4. Income must be >= 25000
   const incomeVal = parseFloat(lead.income || 0);
-  if (isNaN(incomeVal) || incomeVal < 18000) return true;
+  if (isNaN(incomeVal) || incomeVal < 25000) return true;
 
-  // 5. New Validation: State Exclusions (Case-Insensitive)
-  const state = (lead.state || "").trim().toLowerCase();
-  
-  // Exclude Jammu & Kashmir (Covering multiple variations)
-  const isJK = state.includes("jammu") || state.includes("kashmir") || state === "j&k" || state === "j and k";
-  
-  // Exclude North East States (7 Sisters + Sikkim)
-  const northEastStates = [
-    "arunachal pradesh",
-    "assam",
-    "manipur",
-    "meghalaya",
-    "mizoram",
-    "nagaland",
-    "tripura",
-    "sikkim"
-  ];
-  const isNorthEast = northEastStates.includes(state);
-
-  if (isJK || isNorthEast) return true;
+  // 5. Excel Pincode Validation (State checks removed entirely)
+  const leadPincode = String(lead.pincode || "").trim();
+  if (allowedPincodes.size > 0 && !allowedPincodes.has(leadPincode)) {
+    return true; // Skip if pincode is not inside the Excel file
+  }
   
   return false;
 }
 
-// ---------------- TOKEN MANAGMENT WITH AUTO REFRESH ---------------- //
+// ---------------- TOKEN MANAGEMENT ---------------- //
 
 async function getAccessToken() {
   const currentTime = Date.now();
@@ -189,7 +209,7 @@ async function getAccessToken() {
     return cachedToken;
   }
 
-  log("INFO", cachedToken ? "🔄 Token expired (110 mins reached). Refreshing Access Token..." : "🔑 Fetching Initial Access Token...");
+  log("INFO", cachedToken ? "🔄 Token expired. Refreshing Access Token..." : "🔑 Fetching Initial Access Token...");
   
   const res = await axios.post(
     ACCESS_TOKEN_URL,
@@ -207,7 +227,6 @@ async function getAccessToken() {
 // ---------------- PAYLOAD ---------------- //
 
 function buildPayload(doc) {
-  // यहाँ अब doc.name की जगह पूरा doc पास करें
   const [first, last] = splitName(doc); 
   const dobFormatted = formatDob(doc.dob);
 
@@ -219,7 +238,7 @@ function buildPayload(doc) {
 
     PersonerDetails: {
       FirstName: first,
-      LastName: last, // अब यहाँ सही 'Chovatiya' चला जाएगा
+      LastName: last,
       Email: doc.email || "NA",
       PhoneNumber: doc.phone,
       DateOfBirth: dobFormatted,
@@ -247,7 +266,7 @@ function buildPayload(doc) {
 
 async function sendLead(lead, headers) {
   const payload = buildPayload(lead);
-  console.log("Sending payload for:", lead.name);
+  console.log("Sending payload for:", lead.name, "Pin:", lead.pincode);
 
   let apiResponse;
   let isSuccess = false;
@@ -279,6 +298,7 @@ async function sendLead(lead, headers) {
       phone: lead.phone,
       pan: lead.pan,
       name: lead.name,
+      pincode: lead.pincode,
       status: isSuccess ? "SUCCESS" : "FAILED",
       api_response: apiResponse,
       createdAt: new Date().toISOString().slice(0, 10),
@@ -332,7 +352,6 @@ async function runWithConcurrencyLimit(items, limit, fn) {
   return successCount;
 }
 
-// Dynamics headers injection inside batch injection to maintain updated tokens
 async function processBatch(batch) {
   const token = await getAccessToken(); 
   const headers = {
@@ -398,6 +417,11 @@ async function processLeads() {
 
 async function main() {
   try {
+    if (allowedPincodes.size === 0) {
+      log("ERROR", "❌ No pincodes loaded from Excel. Aborting execution.");
+      return;
+    }
+
     await connectMongo();
     await processLeads();
   } catch (err) {
