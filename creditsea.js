@@ -5,8 +5,8 @@ const axios = require("axios");
 require("dotenv").config();
 
 // Configuration
-const BATCH_SIZE = 1;
-const TARGET_SUCCESS = 3000;
+const BATCH_SIZE = 50000;
+const TARGET_SUCCESS = 60000;
 const LENDER_NAME = "creditsea"; // Tracker label for main collection
 
 const BASE_URL = "https://backend.creditsea.com/api/v1";
