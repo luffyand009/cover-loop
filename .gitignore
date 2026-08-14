@@ -12,6 +12,11 @@ yarn-error.log*
 
 # Runtime data
 
+# Environment variables
+.env
+.env.local
+.env.*.local
+
 pids/
 *.pid
 *.seed
