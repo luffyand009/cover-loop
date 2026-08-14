@@ -7,7 +7,7 @@ require("dotenv").config();
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "cover";
 
-const LEAD_COLLECTION = "smcoll";
+const LEAD_COLLECTION = "api_user";
 const RESPONSE_COLLECTION = "keshva";
 
 const ACCESS_TOKEN_URL = "https://api.flexsalary.com/apiv1/api/AccessToken/Post";
