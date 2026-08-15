@@ -1,25 +1,63 @@
 const { MongoClient } = require("mongodb");
 const axios = require("axios");
+const path = require("path");
+const XLSX = require("xlsx"); // 👈 Excel read karne ke liye
 require("dotenv").config();
 
 const MONGO_URI = process.env.MONGO_URI_COVER;
-const DB_NAME = "cover";
+const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "api_user";
-const RESPONSE_COLLECTION = "vivi_user";
+const LEAD_COLLECTION = "cashkuber";
+const RESPONSE_COLLECTION = "keshva_vivi";
 
 const ACCESS_TOKEN_URL = "https://api.flexsalary.com/apiv1/api/AccessToken/Post";
 const LEAD_API_URL = "https://api.flexsalary.com/apiv1/api/LeadCustomer/Post";
 
-const USERNAME = "CoverMantra";
-const PASSWORD = "DvI}rMg]HyP[jXa[";
-const CAMPAIGN_ID = 9192300;
-const LENDER_NAME = "flexsalary";
+const USERNAME = "LP_KeshvaCredit";
+const PASSWORD = "Ia0#7264#5";
+const CAMPAIGN_ID = 577759020;
+const LENDER_NAME = "vivifin";
+
+// ------------ LOAD PINCODES FROM EXCEL ------------ //
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "vivi.xlsx"); // Aap apni file ka path yahan adjust kar sakte hain
+
+function loadValidPincodes() {
+  try {
+    const workbook = XLSX.readFile(PINCODE_FILE_PATH);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    
+    const data = XLSX.utils.sheet_to_json(worksheet);
+    const pincodes = new Set();
+    
+    data.forEach((row) => {
+      const pinKey = Object.keys(row).find(
+        (key) => key.trim().toLowerCase() === 'pincode' || key.trim().toLowerCase() === 'pin'
+      );
+
+      if (pinKey && row[pinKey]) {
+        const cleanPin = String(row[pinKey]).trim();
+        if (cleanPin) {
+          pincodes.add(cleanPin);
+        }
+      }
+    });
+
+    console.log(`✅ Loaded ${pincodes.size} valid pincodes from Excel.`);
+    return pincodes;
+  } catch (error) {
+    console.error(`❌ Error loading pincode file: ${error.message}`);
+    return new Set();
+  }
+}
+
+const allowedPincodes = loadValidPincodes();
 
 // ------------ CONTROL ------------ //
 
-const MAX_LEADS = 5000000;
-const BATCH_SIZE = 500;
+const MAX_LEADS = 500000;
+const SKIP = 1;
+const BATCH_SIZE = 100;
 const MAX_WORKERS = 7;
 const REQUEST_TIMEOUT = 30000; // ms
 const BATCH_DELAY = 1000; // ms
@@ -129,56 +167,40 @@ function mapIncomeType(emp) {
   return emp && emp.toLowerCase() === "self employed" ? 2 : 6;
 }
 
-// Detailed shouldSkip logic
 function shouldSkip(lead) {
   // 1. Basic required fields check
-  const required = ["phone", "pan", "dob", "gender", "name"];
+  const required = ["phone", "pan", "dob", "gender", "name", "pincode"];
   for (const field of required) {
-    if (!lead[field]) return "MISSING_REQUIRED_FIELD";
+    if (!lead[field]) return true;
   }
-  if (formatDob(lead.dob) === null) return "INVALID_DOB";
+  if (formatDob(lead.dob) === null) return true;
   
   // 2. Check if already processed
   if (lead.processed && Array.isArray(lead.processed)) {
     const hasAlreadyProcessed = lead.processed.some(
-      (lender) => String(lender).toLowerCase().startsWith(LENDER_NAME.toLowerCase())
+      (lender) => String(lender).toLowerCase() === LENDER_NAME.toLowerCase()
     );
-    if (hasAlreadyProcessed) return "ALREADY_PROCESSED";
+    if (hasAlreadyProcessed) return true;
   }
 
-  // 3. Employment Validation
+  // 3. Employment must be "salaried" (Case-Insensitive)
   const emp = (lead.employment || "").trim().toLowerCase();
-  if (emp === "self employed" || emp === "selfemployed" || emp === "self-employed") {
-    return "SELF_EMPLOYED";
-  }
-  if (emp !== "salaried") return "INVALID_EMPLOYMENT";
+  if (emp !== "salaried") return true;
 
-  // 4. Income Validation
+  // 4. Income must be >= 25000
   const incomeVal = parseFloat(lead.income || 0);
-  if (isNaN(incomeVal) || incomeVal < 25000) return "LOW_INCOME";
+  if (isNaN(incomeVal) || incomeVal < 25000) return true;
 
-  // 5. State Exclusions
-  const state = (lead.state || "").trim().toLowerCase();
-  const isJK = state.includes("jammu") || state.includes("kashmir") || state === "j&k" || state === "j and k";
-  
-  const northEastStates = [
-    "arunachal pradesh",
-    "assam",
-    "manipur",
-    "meghalaya",
-    "mizoram",
-    "nagaland",
-    "tripura",
-    "sikkim"
-  ];
-  const isNorthEast = northEastStates.includes(state);
-
-  if (isJK || isNorthEast) return "EXCLUDED_STATE";
+  // 5. Excel Pincode Validation (State checks removed entirely)
+  const leadPincode = String(lead.pincode || "").trim();
+  if (allowedPincodes.size > 0 && !allowedPincodes.has(leadPincode)) {
+    return true; // Skip if pincode is not inside the Excel file
+  }
   
   return false;
 }
 
-// ---------------- TOKEN MANAGEMENT WITH AUTO REFRESH ---------------- //
+// ---------------- TOKEN MANAGEMENT ---------------- //
 
 async function getAccessToken() {
   const currentTime = Date.now();
@@ -187,7 +209,7 @@ async function getAccessToken() {
     return cachedToken;
   }
 
-  log("INFO", cachedToken ? "🔄 Token expired (110 mins reached). Refreshing Access Token..." : "🔑 Fetching Initial Access Token...");
+  log("INFO", cachedToken ? "🔄 Token expired. Refreshing Access Token..." : "🔑 Fetching Initial Access Token...");
   
   const res = await axios.post(
     ACCESS_TOKEN_URL,
@@ -244,7 +266,7 @@ function buildPayload(doc) {
 
 async function sendLead(lead, headers) {
   const payload = buildPayload(lead);
-  console.log("Sending payload for:", lead.name);
+  console.log("Sending payload for:", lead.name, "Pin:", lead.pincode);
 
   let apiResponse;
   let isSuccess = false;
@@ -276,6 +298,7 @@ async function sendLead(lead, headers) {
       phone: lead.phone,
       pan: lead.pan,
       name: lead.name,
+      pincode: lead.pincode,
       status: isSuccess ? "SUCCESS" : "FAILED",
       api_response: apiResponse,
       createdAt: new Date().toISOString().slice(0, 10),
@@ -348,92 +371,57 @@ function sleep(ms) {
 }
 
 async function processLeads() {
-  log("INFO", "🔍 Fetching unprocessed leads from MongoDB...");
-
-  // Query jo 'flexsalary' se start hone wale kisi bhi status ko skip karegi
-  const query = {
-    $or: [
-      { processed: { $exists: false } },
-      { processed: { $regex: "^((?!flexsalary).)*$", $options: "i" } }
-    ]
-  };
-
-  const cursor = leadCol.find(query).limit(MAX_LEADS);
+  const cursor = leadCol
+    .find({
+      $or: [
+        { processed: { $exists: false } },
+        { processed: { $ne: LENDER_NAME } },
+      ],
+    })
+    .skip(SKIP)
+    .limit(MAX_LEADS);
 
   let total = 0;
   let processed = 0;
   let skipped = 0;
-  
   let batch = [];
-  let skippedBulkOps = [];
 
   for await (const lead of cursor) {
     total++;
 
-    // Scan Heartbeat Log (har 1,000 leads par)
-    if (total % 1000 === 0) {
-      log("INFO", `Scanned ${total} records... (Queue for API: ${batch.length}, Total Skipped: ${skipped})`);
-    }
-
-    const skipReason = shouldSkip(lead);
-
-    if (skipReason) {
-      // Agar pehle se processed hai, to wapas DB write nahi karenge
-      if (skipReason === "ALREADY_PROCESSED") continue;
-
+    if (shouldSkip(lead)) {
       skipped++;
-
-      // 🎯 HAR REASON KO DEDICATED SKIP TAG SATH MONGO ME UPDATE KARENGE
-      const skipTag = `${LENDER_NAME}: skipped_${skipReason}`;
-
-      skippedBulkOps.push({
-        updateOne: {
-          filter: { _id: lead._id },
-          update: { $addToSet: { processed: skipTag } }
-        }
-      });
-
-      // Bulk write batch size ke according execute hoga
-      if (skippedBulkOps.length >= BATCH_SIZE) {
-        await leadCol.bulkWrite(skippedBulkOps);
-        skippedBulkOps = [];
-      }
-
       continue;
     }
 
     batch.push(lead);
 
     if (batch.length === BATCH_SIZE) {
-      log("INFO", `🚀 Processing batch of ${batch.length} leads to API...`);
       processed += await processBatch(batch);
       batch = [];
       await sleep(BATCH_DELAY);
     }
   }
 
-  // Final remaining API batch
   if (batch.length) {
-    log("INFO", `🚀 Processing final batch of ${batch.length} leads to API...`);
     processed += await processBatch(batch);
   }
 
-  // Final remaining Skipped DB updates
-  if (skippedBulkOps.length > 0) {
-    await leadCol.bulkWrite(skippedBulkOps);
-    skippedBulkOps = [];
-  }
-
   log("INFO", "----- SUMMARY -----");
-  log("INFO", `TOTAL UNPROCESSED FETCHED : ${total}`);
-  log("INFO", `PROCESSED (SUCCESS/API)   : ${processed}`);
-  log("INFO", `TOTAL SKIPPED (UPDATED DB)  : ${skipped}`);
+  log("INFO", `TOTAL FETCHED : ${total}`);
+  log("INFO", `PROCESSED     : ${processed}`);
+  log("INFO", `SKIPPED       : ${skipped}`);
 }
 
 // ---------------- RUN ---------------- //
 
 async function main() {
   try {
+    if (allowedPincodes.size === 0) {
+      log("ERROR", "❌ No pincodes loaded from Excel. Aborting execution.");
+      return;
+    }
+
     await connectMongo();
     await processLeads();
   } catch (err) {

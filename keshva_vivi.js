@@ -1,14 +1,14 @@
 const { MongoClient } = require("mongodb");
 const axios = require("axios");
 const path = require("path");
-const XLSX = require("xlsx"); // 👈 Excel read karne ke liye
+const XLSX = require("xlsx");
 require("dotenv").config();
 
 const MONGO_URI = process.env.MONGO_URI_COVER;
-const DB_NAME = "cover";
+const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "api_user";
-const RESPONSE_COLLECTION = "keshva";
+const LEAD_COLLECTION = "cashkuber";
+const RESPONSE_COLLECTION = "keshva_vivi";
 
 const ACCESS_TOKEN_URL = "https://api.flexsalary.com/apiv1/api/AccessToken/Post";
 const LEAD_API_URL = "https://api.flexsalary.com/apiv1/api/LeadCustomer/Post";
@@ -19,7 +19,7 @@ const CAMPAIGN_ID = 577759020;
 const LENDER_NAME = "vivifin";
 
 // ------------ LOAD PINCODES FROM EXCEL ------------ //
-const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "vivi.xlsx"); // Aap apni file ka path yahan adjust kar sakte hain
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "vivi.xlsx");
 
 function loadValidPincodes() {
   try {
@@ -56,7 +56,6 @@ const allowedPincodes = loadValidPincodes();
 // ------------ CONTROL ------------ //
 
 const MAX_LEADS = 500000;
-const SKIP = 1;
 const BATCH_SIZE = 100;
 const MAX_WORKERS = 7;
 const REQUEST_TIMEOUT = 30000; // ms
@@ -167,34 +166,35 @@ function mapIncomeType(emp) {
   return emp && emp.toLowerCase() === "self employed" ? 2 : 6;
 }
 
+// Detailed shouldSkip logic with precise tagging
 function shouldSkip(lead) {
   // 1. Basic required fields check
   const required = ["phone", "pan", "dob", "gender", "name", "pincode"];
   for (const field of required) {
-    if (!lead[field]) return true;
+    if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
-  if (formatDob(lead.dob) === null) return true;
+  if (formatDob(lead.dob) === null) return "INVALID_DOB";
   
   // 2. Check if already processed
   if (lead.processed && Array.isArray(lead.processed)) {
     const hasAlreadyProcessed = lead.processed.some(
-      (lender) => String(lender).toLowerCase() === LENDER_NAME.toLowerCase()
+      (lender) => String(lender).toLowerCase().startsWith(LENDER_NAME.toLowerCase())
     );
-    if (hasAlreadyProcessed) return true;
+    if (hasAlreadyProcessed) return "ALREADY_PROCESSED";
   }
 
-  // 3. Employment must be "salaried" (Case-Insensitive)
+  // 3. Employment Validation
   const emp = (lead.employment || "").trim().toLowerCase();
-  if (emp !== "salaried") return true;
+  if (emp !== "salaried") return "INVALID_EMPLOYMENT";
 
-  // 4. Income must be >= 25000
+  // 4. Income Validation
   const incomeVal = parseFloat(lead.income || 0);
-  if (isNaN(incomeVal) || incomeVal < 25000) return true;
+  if (isNaN(incomeVal) || incomeVal < 25000) return "LOW_INCOME";
 
-  // 5. Excel Pincode Validation (State checks removed entirely)
+  // 5. Excel Pincode Validation
   const leadPincode = String(lead.pincode || "").trim();
   if (allowedPincodes.size > 0 && !allowedPincodes.has(leadPincode)) {
-    return true; // Skip if pincode is not inside the Excel file
+    return "EXCLUDED_PINCODE";
   }
   
   return false;
@@ -371,32 +371,58 @@ function sleep(ms) {
 }
 
 async function processLeads() {
-  const cursor = leadCol
-    .find({
-      $or: [
-        { processed: { $exists: false } },
-        { processed: { $ne: LENDER_NAME } },
-      ],
-    })
-    .skip(SKIP)
-    .limit(MAX_LEADS);
+  log("INFO", "🔍 Fetching unprocessed leads from MongoDB...");
+
+  const query = {
+    $or: [
+      { processed: { $exists: false } },
+      { processed: { $regex: `^((?!${LENDER_NAME}).)*$`, $options: "i" } }
+    ]
+  };
+
+  const cursor = leadCol.find(query).limit(MAX_LEADS);
 
   let total = 0;
   let processed = 0;
   let skipped = 0;
+  
   let batch = [];
+  let skippedBulkOps = [];
 
   for await (const lead of cursor) {
     total++;
 
-    if (shouldSkip(lead)) {
+    if (total % 1000 === 0) {
+      log("INFO", `Scanned ${total} records... (Queue for API: ${batch.length}, Total Skipped: ${skipped})`);
+    }
+
+    const skipReason = shouldSkip(lead);
+
+    if (skipReason) {
+      if (skipReason === "ALREADY_PROCESSED") continue;
+
       skipped++;
+      const skipTag = `${LENDER_NAME}: skipped_${skipReason}`;
+
+      skippedBulkOps.push({
+        updateOne: {
+          filter: { _id: lead._id },
+          update: { $addToSet: { processed: skipTag } }
+        }
+      });
+
+      if (skippedBulkOps.length >= BATCH_SIZE) {
+        await leadCol.bulkWrite(skippedBulkOps);
+        skippedBulkOps = [];
+      }
+
       continue;
     }
 
     batch.push(lead);
 
     if (batch.length === BATCH_SIZE) {
+      log("INFO", `🚀 Processing batch of ${batch.length} leads to API...`);
       processed += await processBatch(batch);
       batch = [];
       await sleep(BATCH_DELAY);
@@ -404,13 +430,19 @@ async function processLeads() {
   }
 
   if (batch.length) {
+    log("INFO", `🚀 Processing final batch of ${batch.length} leads to API...`);
     processed += await processBatch(batch);
   }
 
+  if (skippedBulkOps.length > 0) {
+    await leadCol.bulkWrite(skippedBulkOps);
+    skippedBulkOps = [];
+  }
+
   log("INFO", "----- SUMMARY -----");
-  log("INFO", `TOTAL FETCHED : ${total}`);
-  log("INFO", `PROCESSED     : ${processed}`);
-  log("INFO", `SKIPPED       : ${skipped}`);
+  log("INFO", `TOTAL UNPROCESSED FETCHED : ${total}`);
+  log("INFO", `PROCESSED (SUCCESS/API)   : ${processed}`);
+  log("INFO", `TOTAL SKIPPED (UPDATED DB)  : ${skipped}`);
 }
 
 // ---------------- RUN ---------------- //
