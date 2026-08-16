@@ -22,19 +22,19 @@ const FATAKPAY_PASSWORD = "cdcbb765b95f0cf06d0f";
 const LENDER_NAME = "fatakpayPl";
 
 // Processing Configuration
-const MAX_LEADS_DAILY = 500000; // 🎯 Daily limit set to 5 Lakhs
+const MAX_LEADS_DAILY = 500000; // 🎯 Strict Daily Limit: 5 Lakhs
 const SKIP = 0;
-const BATCH_SIZE = 500;
-const MAX_THREADS = 10; // max concurrency per batch
+const BATCH_SIZE = 200;       // 👈 500 से घटाकर 200 किया ताकि सर्वर पर लोड कम हो
+const MAX_THREADS = 5;        // 👈 10 से घटाकर 5 किया (429 एरर से पूरी तरह बचने के लिए)
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
 const REQUEST_TIMEOUT = 15000; // ms
 
-// Rate Limiting Configuration
-const API_CALL_DELAY = 100; // ms
-const BATCH_DELAY = 2000; // ms
-const THREAD_DELAY = 100; // ms
-const MAX_REQUESTS_PER_SECOND = 10;
+// Rate Limiting Configuration (धीमी और सुरक्षित गति)
+const API_CALL_DELAY = 250;   // ms
+const BATCH_DELAY = 2000;     // ms
+const THREAD_DELAY = 150;     // ms
+const MAX_REQUESTS_PER_SECOND = 20;
 
 // Validation Configuration
 const MIN_AGE = 18;
@@ -43,7 +43,7 @@ const MIN_INCOME = 15000;
 
 // ==================== LOGGING SETUP ==================== //
 
-const LOG_FILE = "fatakpay_processingDCL.log";
+const LOG_FILE = "fatakpay_processingPl.log";
 
 function log(level, message) {
   const timestamp = new Date().toISOString().replace("T", " ").slice(0, 23);
@@ -51,9 +51,7 @@ function log(level, message) {
   console.log(line);
   try {
     fs.appendFileSync(LOG_FILE, line + "\n");
-  } catch (e) {
-    // ignore file logging failures
-  }
+  } catch (e) {}
 }
 
 const logger = {
@@ -113,9 +111,7 @@ class RateLimiter {
       const current = Date.now();
       const elapsed = current - this.lastCall;
       const waitTime = Math.max(0, this.minInterval - elapsed);
-      if (waitTime > 0) {
-        await sleep(waitTime);
-      }
+      if (waitTime > 0) await sleep(waitTime);
       this.lastCall = Date.now();
     } finally {
       unlock();
@@ -137,81 +133,19 @@ class Counters {
     this.tokenErrors = 0;
     this.tokenRegenerations = 0;
     this.startTime = null;
-    this.successfulLeads = [];
-    this.failedLeads = [];
   }
 
-  startTiming() {
-    this.startTime = Date.now();
-  }
-
-  incrementEligibility(count = 1) {
-    this.eligibilitySuccess += count;
-  }
-  incrementTraversed(count = 1) {
-    this.traversedLeads += count;
-  }
-  incrementRejected(count = 1) {
-    this.rejectedLeads += count;
-  }
-  incrementApiErrors(count = 1) {
-    this.apiErrors += count;
-  }
-  incrementTokenErrors(count = 1) {
-    this.tokenErrors += count;
-  }
-  incrementTokenRegenerations(count = 1) {
-    this.tokenRegenerations += count;
-  }
-  incrementDuplicate(count = 1) {
-    this.duplicateLeads += count;
-  }
-
-  addSuccessfulLead(phone, status, details = "") {
-    this.successfulLeads.push({
-      phone,
-      status,
-      details,
-      timestamp: new Date().toTimeString().slice(0, 8),
-    });
-    if (this.successfulLeads.length > 50) {
-      this.successfulLeads = this.successfulLeads.slice(-50);
-    }
-  }
-
-  addFailedLead(phone, status, errorDetails = "") {
-    this.failedLeads.push({
-      phone,
-      status,
-      error: errorDetails,
-      timestamp: new Date().toTimeString().slice(0, 8),
-    });
-    if (this.failedLeads.length > 50) {
-      this.failedLeads = this.failedLeads.slice(-50);
-    }
-  }
-
-  getStats() {
-    const totalTime = this.startTime ? (Date.now() - this.startTime) / 1000 : 0;
-    return {
-      traversedLeads: this.traversedLeads,
-      eligibilitySuccess: this.eligibilitySuccess,
-      rejectedLeads: this.rejectedLeads,
-      apiErrors: this.apiErrors,
-      duplicateLeads: this.duplicateLeads,
-      tokenErrors: this.tokenErrors,
-      tokenRegenerations: this.tokenRegenerations,
-      totalTime,
-      currentRate: totalTime > 0 ? this.traversedLeads / totalTime : 0,
-      recentSuccessful: this.successfulLeads.slice(-10),
-      recentFailed: this.failedLeads.slice(-10),
-    };
-  }
+  startTiming() { this.startTime = Date.now(); }
+  incrementEligibility(count = 1) { this.eligibilitySuccess += count; }
+  incrementTraversed(count = 1) { this.traversedLeads += count; }
+  incrementRejected(count = 1) { this.rejectedLeads += count; }
+  incrementApiErrors(count = 1) { this.apiErrors += count; }
+  incrementTokenErrors(count = 1) { this.tokenErrors += count; }
+  incrementTokenRegenerations(count = 1) { this.tokenRegenerations += count; }
+  incrementDuplicate(count = 1) { this.duplicateLeads += count; }
 }
 
 const counters = new Counters();
-
-// ==================== DATA TRANSFER OBJECT ==================== //
 
 function makeProcessResult({ leadId, phone, pan, status, responses, success, shouldSave = true }) {
   return { leadId, phone, pan, status, responses, success, shouldSave };
@@ -223,10 +157,7 @@ class FatakPayAPIClient {
   constructor() {
     this.token = null;
     this.tokenExpiry = null;
-    this.credentials = {
-      username: "CoverMantra",
-      password: "f5a4eac0a175129a597d",
-    };
+    this.credentials = { username: FATAKPAY_USERNAME, password: FATAKPAY_PASSWORD };
     this._tokenLock = new Mutex();
     this.axios = this._createAxiosInstance();
   }
@@ -237,11 +168,8 @@ class FatakPayAPIClient {
       axiosRetry(instance, {
         retries: MAX_RETRIES,
         retryDelay: (retryCount) => Math.pow(RETRY_BACKOFF, retryCount) * 1000,
-        retryCondition: (error) =>
-          [429, 500, 502, 503, 504].includes(error.response?.status),
+        retryCondition: (error) => [429, 500, 502, 503, 504].includes(error.response?.status),
       });
-    } else {
-      logger.warning("⚠️ axios-retry not installed — retries on 429/5xx are disabled.");
     }
     return instance;
   }
@@ -249,24 +177,16 @@ class FatakPayAPIClient {
   async ensureToken() {
     const unlock = await this._tokenLock.lock();
     try {
-      const now = new Date();
-      if (this.token && this.tokenExpiry && now < this.tokenExpiry) {
-        return;
-      }
-      logger.info("🔄 Generating new token...");
+      if (this.token && this.tokenExpiry && new Date() < this.tokenExpiry) return;
       for (let attempt = 0; attempt < 3; attempt++) {
         const token = await this.getToken();
         if (token) {
           this.token = token;
           this.tokenExpiry = new Date(Date.now() + 55 * 60 * 1000);
-          logger.info("✅ New token generated successfully");
           return;
-        } else {
-          logger.warning(`⚠️ Token generation failed, attempt ${attempt + 1}/3`);
-          if (attempt < 2) await sleep(2000);
         }
+        if (attempt < 2) await sleep(2000);
       }
-      logger.error("❌ Failed to generate token after 3 attempts");
     } finally {
       unlock();
     }
@@ -275,7 +195,6 @@ class FatakPayAPIClient {
   async forceTokenRegeneration() {
     const unlock = await this._tokenLock.lock();
     try {
-      logger.warning("🔄 Force regenerating token...");
       this.token = null;
       this.tokenExpiry = null;
       for (let attempt = 0; attempt < 3; attempt++) {
@@ -284,15 +203,11 @@ class FatakPayAPIClient {
           this.token = token;
           this.tokenExpiry = new Date(Date.now() + 55 * 60 * 1000);
           counters.incrementTokenRegenerations();
-          logger.info("✅ Forced token regeneration successful");
           return true;
-        } else {
-          logger.warning(`⚠️ Forced regeneration attempt ${attempt + 1} failed`);
-          await sleep(1000);
         }
+        await sleep(1000);
       }
       counters.incrementTokenErrors();
-      logger.error("❌ Forced token regeneration failed after attempts");
       return false;
     } finally {
       unlock();
@@ -301,32 +216,14 @@ class FatakPayAPIClient {
 
   async getToken() {
     try {
-      logger.info("🔑 Making token request...");
       const response = await this.axios.post(FATAKPAY_TOKEN_URL, this.credentials, {
-        headers: {
-          "Content-Type": "application/json",
-          "User-Agent": "CoverMantra/1.0",
-        },
+        headers: { "Content-Type": "application/json", "User-Agent": "CoverMantra/1.0" },
         timeout: 20000,
         validateStatus: () => true,
       });
-
-      if (response.status !== 200) {
-        logger.error(`🔑 Token API returned status: ${response.status}`);
-        return null;
-      }
-
-      const data = response.data;
-      const token = data?.data?.token;
-      if (!token) {
-        logger.error("❌ Token not found in response data");
-        return null;
-      }
-
-      logger.info("✅ Token successfully extracted");
-      return token;
+      if (response.status !== 200) return null;
+      return response.data?.data?.token || null;
     } catch (e) {
-      logger.error(`❌ Error fetching token: ${e.message}`);
       return null;
     }
   }
@@ -334,19 +231,10 @@ class FatakPayAPIClient {
 
 // ==================== VALIDATION FUNCTIONS ==================== //
 
-const INVALID_DATES = new Set([
-  "0000-00-00",
-  "01/01/1900",
-  "01/01/0001",
-  "1900-01-01",
-  "01-01-1900",
-  "1990-01-01",
-]);
+const INVALID_DATES = new Set(["0000-00-00", "01/01/1900", "01/01/0001", "1900-01-01", "01-01-1900", "1990-01-01"]);
 
 function calculateAge(dobValue) {
-  if (!dobValue) return 0;
-  if (INVALID_DATES.has(String(dobValue).trim())) return 0;
-
+  if (!dobValue || INVALID_DATES.has(String(dobValue).trim())) return 0;
   try {
     let dob = null;
     if (dobValue instanceof Date) {
@@ -362,19 +250,14 @@ function calculateAge(dobValue) {
           const p0 = parseInt(parts[0], 10);
           const p1 = parseInt(parts[1], 10);
           const year = parseInt(parts[2], 10);
-          if (p0 >= 1 && p0 <= 12 && p1 >= 1 && p1 <= 31) {
-            dob = new Date(year, p0 - 1, p1);
-          } else if (p1 >= 1 && p1 <= 12 && p0 >= 1 && p0 <= 31) {
-            dob = new Date(year, p1 - 1, p0);
-          }
+          if (p0 >= 1 && p0 <= 12 && p1 >= 1 && p1 <= 31) dob = new Date(year, p0 - 1, p1);
+          else if (p1 >= 1 && p1 <= 12 && p0 >= 1 && p0 <= 31) dob = new Date(year, p1 - 1, p0);
         }
       }
-
       if (!dob && dobStr.length === 10 && dobStr[4] === "-" && dobStr[7] === "-") {
         const [year, month, day] = dobStr.split("-").map(Number);
         dob = new Date(year, month - 1, day);
       }
-
       if (!dob && dobStr.length === 10 && dobStr[2] === "-" && dobStr[5] === "-") {
         const parts = dobStr.split("-");
         if (parts[2].length === 4) {
@@ -382,29 +265,21 @@ function calculateAge(dobValue) {
           dob = new Date(year, month - 1, day);
         }
       }
-
       if (!dob) return 0;
     }
 
     const today = new Date();
     let age = today.getFullYear() - dob.getFullYear();
-    const beforeBirthday =
-      today.getMonth() < dob.getMonth() ||
-      (today.getMonth() === dob.getMonth() && today.getDate() < dob.getDate());
+    const beforeBirthday = today.getMonth() < dob.getMonth() || (today.getMonth() === dob.getMonth() && today.getDate() < dob.getDate());
     if (beforeBirthday) age -= 1;
-
     return age > 0 && age < 120 ? age : 0;
   } catch (e) {
     return 0;
   }
 }
 
-function pad2(n) {
-  return String(n).padStart(2, "0");
-}
-function pad4(n) {
-  return String(n).padStart(4, "0");
-}
+function pad2(n) { return String(n).padStart(2, "0"); }
+function pad4(n) { return String(n).padStart(4, "0"); }
 
 function formatDobForFatakpay(dobValue) {
   if (!dobValue) return "1990-01-01";
@@ -414,9 +289,7 @@ function formatDobForFatakpay(dobValue) {
     }
     let dobStr = String(dobValue).trim();
     if (dobStr.includes("T")) dobStr = dobStr.split("T")[0];
-    if (dobStr.length === 10 && dobStr[4] === "-" && dobStr[7] === "-") {
-      return dobStr;
-    }
+    if (dobStr.length === 10 && dobStr[4] === "-" && dobStr[7] === "-") return dobStr;
     const age = calculateAge(dobValue);
     if (age > 0) {
       if (dobStr.includes("/")) {
@@ -425,14 +298,10 @@ function formatDobForFatakpay(dobValue) {
           const month = parseInt(parts[0], 10);
           const day = parseInt(parts[1], 10);
           const year = parseInt(parts[2], 10);
-          if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-            return `${pad4(year)}-${pad2(month)}-${pad2(day)}`;
-          } else if (day >= 1 && day <= 12 && month >= 1 && month <= 31) {
-            return `${pad4(year)}-${pad2(day)}-${pad2(month)}`;
-          }
+          if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return `${pad4(year)}-${pad2(month)}-${pad2(day)}`;
+          else if (day >= 1 && day <= 12 && month >= 1 && month <= 31) return `${pad4(year)}-${pad2(day)}-${pad2(month)}`;
         }
       }
-      return "1990-01-01";
     }
     return "1990-01-01";
   } catch (e) {
@@ -440,20 +309,12 @@ function formatDobForFatakpay(dobValue) {
   }
 }
 
-function isDigitsOnly(str) {
-  return /^\d+$/.test(String(str));
-}
+function isDigitsOnly(str) { return /^\d+$/.test(String(str)); }
 
 function validateLead(lead) {
-  if (!lead.phone || !isDigitsOnly(lead.phone) || String(lead.phone).length !== 10) {
-    return [false, "invalid_phone", 0];
-  }
-  if (!lead.pan || ![10, 12].includes(String(lead.pan).length)) {
-    return [false, "invalid_pan", 0];
-  }
-  if (!lead.pincode || !isDigitsOnly(lead.pincode)) {
-    return [false, "invalid_pincode", 0];
-  }
+  if (!lead.phone || !isDigitsOnly(lead.phone) || String(lead.phone).length !== 10) return [false, "invalid_phone", 0];
+  if (!lead.pan || ![10, 12].includes(String(lead.pan).length)) return [false, "invalid_pan", 0];
+  if (!lead.pincode || !isDigitsOnly(lead.pincode)) return [false, "invalid_pincode", 0];
 
   const age = calculateAge(lead.dob);
   if (age === 0) return [false, "invalid_dob", age];
@@ -462,22 +323,17 @@ function validateLead(lead) {
 
   let incomeValue;
   try {
-    const cleanIncome = String(lead.income || "0").replace(/,/g, "").trim();
-    incomeValue = parseFloat(cleanIncome);
+    incomeValue = parseFloat(String(lead.income || "0").replace(/,/g, "").trim());
     if (isNaN(incomeValue)) throw new Error("NaN");
   } catch (e) {
     return [false, "invalid_income", age];
   }
-
   if (incomeValue < MIN_INCOME) return [false, "low_income", age];
 
   return [true, null, age];
 }
 
-function getConsentTimestamp() {
-  return new Date().toISOString().slice(0, 19);
-}
-
+function getConsentTimestamp() { return new Date().toISOString().slice(0, 19); }
 function getCurrentDate() {
   const d = new Date();
   return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}-${pad2(d.getDate())}`;
@@ -486,28 +342,13 @@ function getCurrentDate() {
 // ==================== API REQUEST HANDLING ==================== //
 
 async function makeFatakpayRequest(client, token, payload) {
-  const headers = {
-    "Content-Type": "application/json",
-    Authorization: token ? `Token ${token}` : "",
-    "User-Agent": "CoverMantra/1.0",
-  };
-
+  const headers = { "Content-Type": "application/json", Authorization: token ? `Token ${token}` : "", "User-Agent": "CoverMantra/1.0" };
   try {
     await rateLimiter.acquire();
     if (API_CALL_DELAY > 0) await sleep(API_CALL_DELAY);
-
-    const response = await client.axios.post(FATAKPAY_ELIGIBILITY_URL, payload, {
-      headers,
-      timeout: REQUEST_TIMEOUT,
-      validateStatus: () => true,
-    });
-
-    if (response.status === 401) {
-      return [response.data ?? { error: "Unauthorized" }, "token_expired"];
-    }
-    if (response.status !== 200) {
-      return [response.data ?? { error: `HTTP ${response.status}` }, `http_error_${response.status}`];
-    }
+    const response = await client.axios.post(FATAKPAY_ELIGIBILITY_URL, payload, { headers, timeout: REQUEST_TIMEOUT, validateStatus: () => true });
+    if (response.status === 401) return [response.data ?? { error: "Unauthorized" }, "token_expired"];
+    if (response.status !== 200) return [response.data ?? { error: `HTTP ${response.status}` }, `http_error_${response.status}`];
     return [response.data, "success"];
   } catch (e) {
     if (e.code === "ECONNABORTED") return [null, "timeout"];
@@ -520,15 +361,8 @@ async function makeFatakpayRequest(client, token, payload) {
 }
 
 function analyzeFatakpayResponse(responseData) {
-  const analysis = {
-    success: false,
-    eligibilityStatus: false,
-    message: "Unknown",
-    reason: "Not analyzed",
-  };
-
+  const analysis = { success: false, eligibilityStatus: false, message: "Unknown", reason: "Not analyzed" };
   if (!responseData) return analysis;
-
   try {
     if (responseData.success === true) {
       analysis.success = true;
@@ -551,7 +385,6 @@ function analyzeFatakpayResponse(responseData) {
 
 async function checkFatakpayEligibility(lead, client) {
   const responses = { eligibility: null, error: null, createdDate: getCurrentDate() };
-
   try {
     const nameParts = (lead.name || "").split(" ");
     const firstName = nameParts[0] || "";
@@ -581,15 +414,7 @@ async function checkFatakpayEligibility(lead, client) {
         [eligibilityResp, status] = await makeFatakpayRequest(client, client.token, payload);
         responses.eligibility = eligibilityResp;
       } else {
-        counters.addFailedLead(lead.phone, "token_expired", "Token regeneration failed");
-        return makeProcessResult({
-          leadId: String(lead._id),
-          phone: String(lead.phone),
-          pan: lead.pan || "",
-          status: "token_expired",
-          responses,
-          success: false,
-        });
+        return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "token_expired", responses, success: false });
       }
     }
 
@@ -597,22 +422,17 @@ async function checkFatakpayEligibility(lead, client) {
 
     if (analysis.success && analysis.eligibilityStatus) {
       counters.incrementEligibility();
-      counters.addSuccessfulLead(lead.phone, "eligible", analysis.message);
       return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "eligible", responses, success: true });
     } else if (analysis.success && !analysis.eligibilityStatus) {
-      counters.addFailedLead(lead.phone, "not_eligible", analysis.reason);
       return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "not_eligible", responses, success: false });
     } else if (String(analysis.message).toLowerCase().includes("already exists")) {
       counters.incrementDuplicate();
-      counters.addFailedLead(lead.phone, "duplicate", analysis.message);
       return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "duplicate", responses, success: false });
     } else {
-      counters.addFailedLead(lead.phone, "api_rejected", analysis.message);
       return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "not_eligible", responses, success: false });
     }
   } catch (e) {
     counters.incrementApiErrors();
-    counters.addFailedLead(lead.phone, "processing_error", e.message);
     responses.error = { message: e.message };
     return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "api_error", responses, success: false });
   }
@@ -621,19 +441,10 @@ async function checkFatakpayEligibility(lead, client) {
 async function processSingleLead(client, lead) {
   try {
     const [isValid, rejectionReason, age] = validateLead(lead);
-
     if (!isValid) {
       counters.incrementTraversed();
       counters.incrementRejected();
-      counters.addFailedLead(lead.phone, "validation_failed", rejectionReason);
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: "validation_failed",
-        responses: { validation_error: rejectionReason, age },
-        success: false,
-      });
+      return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "validation_failed", responses: { validation_error: rejectionReason, age }, success: false });
     }
 
     await client.ensureToken();
@@ -643,7 +454,6 @@ async function processSingleLead(client, lead) {
   } catch (e) {
     counters.incrementTraversed();
     counters.incrementApiErrors();
-    counters.addFailedLead(lead.phone, "thread_error", e.message);
     return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "processing_error", responses: { error: e.message }, success: false });
   }
 }
@@ -659,12 +469,7 @@ async function getLeadsBatch(skip, limit) {
           { processed: { $regex: `^((?!${LENDER_NAME}).)*$`, $options: "i" } },
         ],
       },
-      {
-        projection: {
-          name: 1, gender: 1, phone: 1, pan: 1, dob: 1,
-          employment: 1, income: 1, pincode: 1, city: 1, state: 1, email: 1,
-        },
-      },
+      { projection: { name: 1, gender: 1, phone: 1, pan: 1, dob: 1, employment: 1, income: 1, pincode: 1, city: 1, state: 1, email: 1 } },
     )
     .skip(skip)
     .limit(limit)
@@ -675,27 +480,21 @@ async function runBatchConcurrently(client, leadsBatch) {
   const results = [];
   const concurrency = Math.min(MAX_THREADS, leadsBatch.length);
   let nextIndex = 0;
-  let started = 0;
 
   async function worker() {
     while (true) {
       const currentIndex = nextIndex++;
       if (currentIndex >= leadsBatch.length) return;
-
       const currentLead = leadsBatch[currentIndex];
       try {
         const result = await Promise.race([
           processSingleLead(client, currentLead),
-          sleep(45000).then(() => {
-            throw new Error("processSingleLead timed out after 45s");
-          }),
+          sleep(45000).then(() => { throw new Error("processSingleLead timed out after 45s"); }),
         ]);
         if (result) results.push(result);
       } catch (e) {
         counters.incrementApiErrors();
       }
-
-      started++;
     }
   }
 
@@ -705,28 +504,21 @@ async function runBatchConcurrently(client, leadsBatch) {
     if (w < concurrency - 1) await sleep(THREAD_DELAY);
   }
   await Promise.all(workers);
-
   return results;
 }
 
 async function processBatch(client, leadsBatch, batchNumber) {
-  const batchStart = Date.now();
   await client.ensureToken();
   if (!client.token) return 0;
-
   const results = await runBatchConcurrently(client, leadsBatch);
   await saveResults(results);
-
-  const batchTime = (Date.now() - batchStart) / 1000;
   const successfulCount = results.filter((r) => r.success).length;
-
-  logger.info(`✅ BATCH ${batchNumber} COMPLETE (Success: ${successfulCount}/${leadsBatch.length}, Time: ${batchTime.toFixed(1)}s)`);
-  return results.length; // Returns total processed count in this batch
+  logger.info(`✅ BATCH ${batchNumber} COMPLETE (Success: ${successfulCount}/${leadsBatch.length})`);
+  return results.length;
 }
 
 async function saveResults(results) {
   if (!results.length) return;
-
   try {
     const apiDocuments = results
       .filter((r) => r.status !== "validation_failed")
@@ -743,7 +535,8 @@ async function saveResults(results) {
       await responseCol.insertMany(apiDocuments, { ordered: false });
     }
 
-    const bulkOps = results.map((result) => {
+    // 🎯 पुराना टैग हटाकर केवल एक सिंगल टैग रखने का लॉजिक
+    for (const result of results) {
       let tag = LENDER_NAME;
       if (result.status === "validation_failed" && result.responses?.validation_error) {
         tag = `${LENDER_NAME}: skipped_${result.responses.validation_error}`;
@@ -751,16 +544,18 @@ async function saveResults(results) {
         tag = `${LENDER_NAME}: skipped_duplicate`;
       }
 
-      return {
-        updateOne: {
-          filter: { _id: new ObjectId(result.leadId) },
-          update: { $addToSet: { processed: tag } },
-        },
-      };
-    });
-
-    if (bulkOps.length > 0) {
-      await leadCol.bulkWrite(bulkOps, { ordered: false });
+      await leadCol.updateOne(
+        { _id: new ObjectId(result.leadId) },
+        { 
+          $pull: { processed: { $regex: `^${LENDER_NAME}`, $options: "i" } } 
+        }
+      );
+      await leadCol.updateOne(
+        { _id: new ObjectId(result.leadId) },
+        { 
+          $addToSet: { processed: tag } 
+        }
+      );
     }
   } catch (e) {
     logger.error(`❌ Database save error: ${e.message}`);
@@ -773,8 +568,7 @@ async function main() {
   const startTime = Date.now();
   await connectMongo();
 
-  logger.info("⚡ HIGH-PERFORMANCE PROCESSING STARTED (Daily Limit: 5 Lakhs)");
-
+  logger.info("⚡ HIGH-PERFORMANCE PROCESSING STARTED (Strict Daily Limit: 5 Lakhs)");
   counters.startTiming();
   const client = new FatakPayAPIClient();
 
@@ -789,6 +583,11 @@ async function main() {
     let batchNum = 1;
 
     while (totalProcessedToday < MAX_LEADS_DAILY) {
+      if (totalProcessedToday >= MAX_LEADS_DAILY) {
+        logger.info("🛑 Daily limit of 5,00,000 reached. Stopping execution.");
+        break;
+      }
+
       const remainingLimit = MAX_LEADS_DAILY - totalProcessedToday;
       const currentLimit = Math.min(BATCH_SIZE, remainingLimit);
 
