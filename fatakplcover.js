@@ -4,7 +4,7 @@ const axiosRetry = (() => {
   try {
     return require("axios-retry").default || require("axios-retry");
   } catch {
-    return null; // optional dependency, see setupRetry()
+    return null;
   }
 })();
 const { MongoClient, ObjectId } = require("mongodb");
@@ -16,14 +16,13 @@ const FATAKPAY_BASE_URL = "https://onboardingapi.fatakpay.com";
 const FATAKPAY_TOKEN_URL = `${FATAKPAY_BASE_URL}/external-api/v1/create-user-token`;
 const FATAKPAY_ELIGIBILITY_URL = `${FATAKPAY_BASE_URL}/external-api/v1/emi-insurance-eligibility`;
 
-
 const MONGO_URI_COVER = process.env.MONGO_URI_COVER;
 const FATAKPAY_USERNAME = "CoverMantra";
 const FATAKPAY_PASSWORD = "cdcbb765b95f0cf06d0f";
 const LENDER_NAME = "fatakpayPl";
 
 // Processing Configuration
-const MAX_LEADS = 318716;
+const MAX_LEADS_DAILY = 500000; // 🎯 Daily limit set to 5 Lakhs
 const SKIP = 0;
 const BATCH_SIZE = 2000;
 const MAX_THREADS = 40; // max concurrency per batch
@@ -34,7 +33,7 @@ const REQUEST_TIMEOUT = 15000; // ms
 // Rate Limiting Configuration
 const API_CALL_DELAY = 0; // ms
 const BATCH_DELAY = 800; // ms
-const THREAD_DELAY = 300; // ms - stagger between task starts, mirrors Python
+const THREAD_DELAY = 300; // ms
 const MAX_REQUESTS_PER_SECOND = 5000;
 
 // Validation Configuration
@@ -67,22 +66,19 @@ const logger = {
 // ==================== MONGO SETUP ==================== //
 
 let mongoClient;
-let leadCol; // "payme"
-let responseCol; // "fatakpayPlResponse"
+let leadCol;
+let responseCol;
 
 async function connectMongo() {
   mongoClient = new MongoClient(MONGO_URI_COVER);
   await mongoClient.connect();
-  const db = mongoClient.db(); // db name comes from the URI path, matches mongoengine's connect(host=...)
-  leadCol = db.collection("smcoll");
-  responseCol = db.collection("fatakpayPlResponse");
+  const db = mongoClient.db();
+  leadCol = db.collection("keshvadb");
+  responseCol = db.collection("fatakpl");
   logger.info("✅ Connected to MongoDB");
 }
 
 // ==================== SIMPLE ASYNC MUTEX ==================== //
-// JS is single-threaded, but overlapping awaits between concurrent tasks
-// can still interleave token reads/writes, so we keep an explicit lock
-// just like the Python threading.Lock() usage.
 
 class Mutex {
   constructor() {
@@ -102,12 +98,11 @@ function sleep(ms) {
 }
 
 // ==================== RATE LIMITER ==================== //
-// Token bucket rate limiter for API calls
 
 class RateLimiter {
   constructor(maxRatePerSecond) {
     this.maxRate = maxRatePerSecond > 0 ? maxRatePerSecond : 1;
-    this.minInterval = 1000 / this.maxRate; // ms
+    this.minInterval = 1000 / this.maxRate;
     this.lastCall = Date.now();
     this.mutex = new Mutex();
   }
@@ -246,9 +241,7 @@ class FatakPayAPIClient {
           [429, 500, 502, 503, 504].includes(error.response?.status),
       });
     } else {
-      logger.warning(
-        "⚠️ axios-retry not installed — retries on 429/5xx are disabled. Run `npm install axios-retry` to enable them.",
-      );
+      logger.warning("⚠️ axios-retry not installed — retries on 429/5xx are disabled.");
     }
     return instance;
   }
@@ -258,14 +251,14 @@ class FatakPayAPIClient {
     try {
       const now = new Date();
       if (this.token && this.tokenExpiry && now < this.tokenExpiry) {
-        return; // still valid
+        return;
       }
       logger.info("🔄 Generating new token...");
       for (let attempt = 0; attempt < 3; attempt++) {
         const token = await this.getToken();
         if (token) {
           this.token = token;
-          this.tokenExpiry = new Date(Date.now() + 55 * 60 * 1000); // 55 min safe window
+          this.tokenExpiry = new Date(Date.now() + 55 * 60 * 1000);
           logger.info("✅ New token generated successfully");
           return;
         } else {
@@ -309,27 +302,21 @@ class FatakPayAPIClient {
   async getToken() {
     try {
       logger.info("🔑 Making token request...");
-
       const response = await this.axios.post(FATAKPAY_TOKEN_URL, this.credentials, {
         headers: {
           "Content-Type": "application/json",
           "User-Agent": "CoverMantra/1.0",
         },
         timeout: 20000,
-        validateStatus: () => true, // handle non-2xx ourselves, like requests without raise_for_status
+        validateStatus: () => true,
       });
-
-      logger.info(`🔑 Token response status: ${response.status}`);
 
       if (response.status !== 200) {
         logger.error(`🔑 Token API returned status: ${response.status}`);
-        logger.error(`🔑 Token response text: ${JSON.stringify(response.data)}`);
         return null;
       }
 
       const data = response.data;
-      logger.info(`🔑 Token API response: ${JSON.stringify(data)}`);
-
       const token = data?.data?.token;
       if (!token) {
         logger.error("❌ Token not found in response data");
@@ -356,22 +343,12 @@ const INVALID_DATES = new Set([
   "1990-01-01",
 ]);
 
-function isValidCalendarDate(year, month, day) {
-  const dt = new Date(year, month - 1, day);
-  return (
-    dt.getFullYear() === year && dt.getMonth() === month - 1 && dt.getDate() === day
-  );
-}
-
-/** Calculate age from DOB with enhanced validation for multiple formats */
 function calculateAge(dobValue) {
   if (!dobValue) return 0;
-
   if (INVALID_DATES.has(String(dobValue).trim())) return 0;
 
   try {
     let dob = null;
-
     if (dobValue instanceof Date) {
       dob = dobValue;
     } else {
@@ -379,57 +356,30 @@ function calculateAge(dobValue) {
       if (dobStr.includes("T")) dobStr = dobStr.split("T")[0];
       if (!dobStr) return 0;
 
-      // Format 1: MM/DD/YYYY or DD/MM/YYYY (like "3/18/1996")
       if (dobStr.includes("/") && dobStr.length <= 10) {
         const parts = dobStr.split("/");
-        if (parts.length === 3 && parts[0].length <= 2 && parts[1].length <= 2 && parts[2].length === 4) {
-          const month = parseInt(parts[0], 10);
-          const day = parseInt(parts[1], 10);
+        if (parts.length === 3 && parts[2].length === 4) {
+          const p0 = parseInt(parts[0], 10);
+          const p1 = parseInt(parts[1], 10);
           const year = parseInt(parts[2], 10);
-          if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-            dob = new Date(year, month - 1, day); // MM/DD/YYYY
-          } else if (day >= 1 && day <= 12 && month >= 1 && month <= 31) {
-            dob = new Date(year, day - 1, month); // DD/MM/YYYY, swapped
+          if (p0 >= 1 && p0 <= 12 && p1 >= 1 && p1 <= 31) {
+            dob = new Date(year, p0 - 1, p1);
+          } else if (p1 >= 1 && p1 <= 12 && p0 >= 1 && p0 <= 31) {
+            dob = new Date(year, p1 - 1, p0);
           }
         }
       }
 
-      // Format 2: YYYY-MM-DD
       if (!dob && dobStr.length === 10 && dobStr[4] === "-" && dobStr[7] === "-") {
         const [year, month, day] = dobStr.split("-").map(Number);
         dob = new Date(year, month - 1, day);
       }
 
-      // Format 3: DD-MM-YYYY
       if (!dob && dobStr.length === 10 && dobStr[2] === "-" && dobStr[5] === "-") {
         const parts = dobStr.split("-");
         if (parts[2].length === 4) {
           const [day, month, year] = parts.map(Number);
           dob = new Date(year, month - 1, day);
-        }
-      }
-
-      // Format 4: single-digit months/days without leading zeros, MM/DD/YYYY fallback
-      if (!dob && dobStr.includes("/")) {
-        const parts = dobStr.split("/");
-        if (parts.length === 3) {
-          const month = parseInt(parts[0], 10);
-          const day = parseInt(parts[1], 10);
-          const year = parseInt(parts[2], 10);
-          const currentYear = new Date().getFullYear();
-          if (
-            !isNaN(month) &&
-            !isNaN(day) &&
-            !isNaN(year) &&
-            month >= 1 &&
-            month <= 12 &&
-            day >= 1 &&
-            day <= 31 &&
-            year >= 1900 &&
-            year <= currentYear
-          ) {
-            dob = new Date(year, month - 1, day);
-          }
         }
       }
 
@@ -445,7 +395,6 @@ function calculateAge(dobValue) {
 
     return age > 0 && age < 120 ? age : 0;
   } catch (e) {
-    logger.warning(`⚠️ DOB parsing error for '${dobValue}': ${e.message}`);
     return 0;
   }
 }
@@ -457,23 +406,17 @@ function pad4(n) {
   return String(n).padStart(4, "0");
 }
 
-/** Format DOB for FatakPay API with multiple format support */
 function formatDobForFatakpay(dobValue) {
   if (!dobValue) return "1990-01-01";
-
   try {
     if (dobValue instanceof Date) {
       return `${pad4(dobValue.getFullYear())}-${pad2(dobValue.getMonth() + 1)}-${pad2(dobValue.getDate())}`;
     }
-
     let dobStr = String(dobValue).trim();
     if (dobStr.includes("T")) dobStr = dobStr.split("T")[0];
-
-    // Already YYYY-MM-DD
     if (dobStr.length === 10 && dobStr[4] === "-" && dobStr[7] === "-") {
       return dobStr;
     }
-
     const age = calculateAge(dobValue);
     if (age > 0) {
       if (dobStr.includes("/")) {
@@ -483,17 +426,16 @@ function formatDobForFatakpay(dobValue) {
           const day = parseInt(parts[1], 10);
           const year = parseInt(parts[2], 10);
           if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
-            return `${pad4(year)}-${pad2(month)}-${pad2(day)}`; // MM/DD/YYYY
+            return `${pad4(year)}-${pad2(month)}-${pad2(day)}`;
           } else if (day >= 1 && day <= 12 && month >= 1 && month <= 31) {
-            return `${pad4(year)}-${pad2(day)}-${pad2(month)}`; // DD/MM/YYYY swapped
+            return `${pad4(year)}-${pad2(day)}-${pad2(month)}`;
           }
         }
       }
-      return "1990-01-01"; // fallback, matches Python's fallback behaviour
+      return "1990-01-01";
     }
     return "1990-01-01";
   } catch (e) {
-    logger.warning(`⚠️ DOB formatting error for '${dobValue}': ${e.message}`);
     return "1990-01-01";
   }
 }
@@ -502,76 +444,38 @@ function isDigitsOnly(str) {
   return /^\d+$/.test(String(str));
 }
 
-/** Validate lead data before processing. Returns [isValid, rejectionReason, age] */
 function validateLead(lead) {
-  logger.info(`🔍 Validating lead: ${lead.phone}`);
-  logger.info(`🔍 DOB ANALYSIS for ${lead.phone}:`);
-  logger.info(`   📅 Original DOB: '${lead.dob}'`);
-  logger.info(`   📅 DOB Type: ${typeof lead.dob}`);
+  if (!lead.phone || !isDigitsOnly(lead.phone) || String(lead.phone).length !== 10) {
+    return [false, "invalid_phone", 0];
+  }
+  if (!lead.pan || ![10, 12].includes(String(lead.pan).length)) {
+    return [false, "invalid_pan", 0];
+  }
+  if (!lead.pincode || !isDigitsOnly(lead.pincode)) {
+    return [false, "invalid_pincode", 0];
+  }
 
   const age = calculateAge(lead.dob);
-  const formattedDob = formatDobForFatakpay(lead.dob);
+  if (age === 0) return [false, "invalid_dob", age];
+  if (age < MIN_AGE) return [false, "age_too_young", age];
+  if (age > MAX_AGE) return [false, "age_too_old", age];
 
-  logger.info(`   📅 Calculated Age: ${age}`);
-  logger.info(`   📅 Formatted for API: ${formattedDob}`);
-
-  // Phone validation
-  if (!lead.phone || !isDigitsOnly(lead.phone) || String(lead.phone).length !== 10) {
-    logger.warning(`❌ Invalid phone: ${lead.phone}`);
-    return [false, "invalid_phone", age];
-  }
-
-  // PAN validation
-  if (!lead.pan || ![10, 12].includes(String(lead.pan).length)) {
-    logger.warning(`❌ Invalid PAN: ${lead.pan}`);
-    return [false, "invalid_pan", age];
-  }
-
-  // Pincode validation
-  if (!lead.pincode || !isDigitsOnly(lead.pincode)) {
-    logger.warning(`❌ Invalid pincode: ${lead.pincode}`);
-    return [false, "invalid_pincode", age];
-  }
-
-  logger.info(`🔍 Final age for validation: ${age}`);
-
-  if (age === 0) {
-    logger.warning(`❌ Invalid DOB: ${lead.dob}`);
-    return [false, "invalid_dob", age];
-  }
-  if (age < MIN_AGE) {
-    logger.warning(`❌ Age too young: ${age}`);
-    return [false, "age_too_young", age];
-  }
-  if (age > MAX_AGE) {
-    logger.warning(`❌ Age too old: ${age}`);
-    return [false, "age_too_old", age];
-  }
-
-  // Income validation
   let incomeValue;
   try {
-    incomeValue = lead.income ? parseFloat(lead.income) : 0;
+    const cleanIncome = String(lead.income || "0").replace(/,/g, "").trim();
+    incomeValue = parseFloat(cleanIncome);
     if (isNaN(incomeValue)) throw new Error("NaN");
-    logger.info(`🔍 Income value: ${incomeValue}`);
   } catch (e) {
-    logger.warning(`❌ Invalid income: ${lead.income}`);
     return [false, "invalid_income", age];
   }
 
-  if (incomeValue < MIN_INCOME) {
-    logger.warning(`❌ Income too low: ${incomeValue}`);
-    return [false, "low_income", age];
-  }
+  if (incomeValue < MIN_INCOME) return [false, "low_income", age];
 
-  logger.info(`✅ Lead validation passed: ${lead.phone}`);
   return [true, null, age];
 }
 
-// ==================== UTILITY FUNCTIONS ==================== //
-
 function getConsentTimestamp() {
-  return new Date().toISOString().slice(0, 19); // YYYY-MM-DDTHH:MM:SS
+  return new Date().toISOString().slice(0, 19);
 }
 
 function getCurrentDate() {
@@ -581,10 +485,6 @@ function getCurrentDate() {
 
 // ==================== API REQUEST HANDLING ==================== //
 
-/**
- * Make API request to FatakPay with rate limiting and error handling.
- * Returns [responseDataOrErrorObj, statusString]
- */
 async function makeFatakpayRequest(client, token, payload) {
   const headers = {
     "Content-Type": "application/json",
@@ -592,96 +492,50 @@ async function makeFatakpayRequest(client, token, payload) {
     "User-Agent": "CoverMantra/1.0",
   };
 
-  const phone = payload.mobile || "unknown";
-
   try {
-    logger.info(`⏳ Rate limiting for ${phone}...`);
     await rateLimiter.acquire();
     if (API_CALL_DELAY > 0) await sleep(API_CALL_DELAY);
 
-    logger.info(`📤 Making API request for ${phone}...`);
-    logger.debug(`📤 Request payload for ${phone}: ${JSON.stringify(payload)}`);
-
-    const start = Date.now();
     const response = await client.axios.post(FATAKPAY_ELIGIBILITY_URL, payload, {
       headers,
       timeout: REQUEST_TIMEOUT,
       validateStatus: () => true,
     });
-    const responseTime = (Date.now() - start) / 1000;
-
-    logger.info(
-      `📥 API response for ${phone} - Status: ${response.status}, Time: ${responseTime.toFixed(2)}s`,
-    );
-    logger.debug(`📥 Response headers for ${phone}: ${JSON.stringify(response.headers)}`);
 
     if (response.status === 401) {
-      const errorData = response.data ?? { error: "Unauthorized" };
-      logger.warning(`⚠️ 401 Unauthorized for ${phone}: ${JSON.stringify(errorData)}`);
-      return [errorData, "token_expired"];
+      return [response.data ?? { error: "Unauthorized" }, "token_expired"];
     }
-
     if (response.status !== 200) {
-      logger.warning(`⚠️ Non-200 response for ${phone}: ${response.status}`);
-      logger.warning(`⚠️ Response text: ${JSON.stringify(response.data).slice(0, 500)}`);
-      const errorData = response.data ?? { error: `HTTP ${response.status}` };
-      return [errorData, `http_error_${response.status}`];
+      return [response.data ?? { error: `HTTP ${response.status}` }, `http_error_${response.status}`];
     }
-
-    logger.info(`✅ API success for ${phone}`);
-    logger.debug(`✅ Full response for ${phone}: ${JSON.stringify(response.data)}`);
-
     return [response.data, "success"];
   } catch (e) {
-    if (e.code === "ECONNABORTED") {
-      logger.error(`⏰ TIMEOUT for ${phone} after ${REQUEST_TIMEOUT / 1000}s`);
-      return [null, "timeout"];
-    }
+    if (e.code === "ECONNABORTED") return [null, "timeout"];
     if (e.response) {
-      const statusCode = e.response.status;
-      const errorData = e.response.data ?? { error: e.message };
-      logger.error(`🌐 HTTP ${statusCode} for ${phone}`);
-      logger.error(`🌐 Error response: ${JSON.stringify(errorData)}`);
-      if (statusCode === 401) return [errorData, "token_expired"];
-      return [errorData, `http_error_${statusCode}`];
+      if (e.response.status === 401) return [e.response.data, "token_expired"];
+      return [e.response.data, `http_error_${e.response.status}`];
     }
-    if (e.request) {
-      logger.error(`🌐 NETWORK ERROR for ${phone}: ${e.message}`);
-      return [null, "network_error"];
-    }
-    logger.error(`💥 UNEXPECTED ERROR for ${phone}: ${e.message}`);
-    return [null, "unexpected_error"];
+    return [null, "network_error"];
   }
 }
 
-/** Comprehensive analysis of FatakPay API response */
 function analyzeFatakpayResponse(responseData) {
   const analysis = {
     success: false,
     eligibilityStatus: false,
     message: "Unknown",
     reason: "Not analyzed",
-    hasLoanApp: false,
-    productType: null,
-    amount: 0,
   };
 
-  if (!responseData) {
-    analysis.message = "Null response";
-    return analysis;
-  }
+  if (!responseData) return analysis;
 
   try {
     if (responseData.success === true) {
       analysis.success = true;
       const data = responseData.data || {};
-
       analysis.eligibilityStatus = Boolean(data.eligibility_status);
       analysis.message = responseData.message || "No message";
       analysis.reason = data.reason || "No reason provided";
-      analysis.hasLoanApp = Boolean(data.loan_application_id);
-      analysis.productType = data.product_type ?? null;
-      analysis.amount = data.max_eligibility_amount || 0;
     } else {
       analysis.success = false;
       analysis.message = responseData.message || "API returned failure";
@@ -690,7 +544,6 @@ function analyzeFatakpayResponse(responseData) {
   } catch (e) {
     analysis.message = `Analysis error: ${e.message}`;
   }
-
   return analysis;
 }
 
@@ -717,28 +570,17 @@ async function checkFatakpayEligibility(lead, client) {
       consent: true,
       consent_timestamp: getConsentTimestamp(),
     };
-    console.log(payload);
-
-    logger.info(`🎯 PROCESSING LEAD: ${lead.phone}`);
-    logger.info(`   📝 Name: ${firstName} ${lastName}`);
-    logger.info(`   📝 PAN: ${lead.pan}`);
-    logger.info(`   📝 DOB: ${formatDobForFatakpay(lead.dob)}`);
-    logger.info(`   📝 Pincode: ${lead.pincode}`);
-    logger.info(`   📝 Income: ${lead.income}`);
 
     let [eligibilityResp, status] = await makeFatakpayRequest(client, client.token, payload);
     responses.eligibility = eligibilityResp;
 
     if (status === "token_expired" || (typeof status === "string" && status.startsWith("http_error_401"))) {
-      logger.warning(`🔑 Token expired / unauthorized for ${lead.phone}. Attempting regeneration...`);
       counters.incrementTokenErrors();
       const regenerated = await client.forceTokenRegeneration();
       if (regenerated) {
-        logger.info(`🔄 Retrying with new token for ${lead.phone}...`);
         [eligibilityResp, status] = await makeFatakpayRequest(client, client.token, payload);
         responses.eligibility = eligibilityResp;
       } else {
-        logger.error(`❌ Token regeneration failed for ${lead.phone}`);
         counters.addFailedLead(lead.phone, "token_expired", "Token regeneration failed");
         return makeProcessResult({
           leadId: String(lead._id),
@@ -753,83 +595,34 @@ async function checkFatakpayEligibility(lead, client) {
 
     const analysis = analyzeFatakpayResponse(eligibilityResp);
 
-    logger.info(`📊 RESPONSE ANALYSIS for ${lead.phone}:`);
-    logger.info(`   ✅ Success: ${analysis.success}`);
-    logger.info(`   ✅ Eligibility: ${analysis.eligibilityStatus}`);
-    logger.info(`   ✅ Message: ${analysis.message}`);
-    logger.info(`   ✅ Reason: ${analysis.reason}`);
-
     if (analysis.success && analysis.eligibilityStatus) {
-      logger.info(`🎉 ELIGIBLE: ${lead.phone} - ${analysis.message}`);
       counters.incrementEligibility();
       counters.addSuccessfulLead(lead.phone, "eligible", analysis.message);
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: "eligible",
-        responses,
-        success: true,
-      });
+      return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "eligible", responses, success: true });
     } else if (analysis.success && !analysis.eligibilityStatus) {
-      logger.info(`❌ NOT ELIGIBLE: ${lead.phone} - ${analysis.reason}`);
       counters.addFailedLead(lead.phone, "not_eligible", analysis.reason);
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: "not_eligible",
-        responses,
-        success: false,
-      });
+      return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "not_eligible", responses, success: false });
     } else if (String(analysis.message).toLowerCase().includes("already exists")) {
-      logger.info(`🔄 DUPLICATE: ${lead.phone} - ${analysis.message}`);
       counters.incrementDuplicate();
       counters.addFailedLead(lead.phone, "duplicate", analysis.message);
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: "duplicate",
-        responses,
-        success: false,
-      });
+      return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "duplicate", responses, success: false });
     } else {
-      logger.warning(`⚠️ API REJECTION: ${lead.phone} - ${analysis.message}`);
       counters.addFailedLead(lead.phone, "api_rejected", analysis.message);
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: "not_eligible",
-        responses,
-        success: false,
-      });
+      return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "not_eligible", responses, success: false });
     }
   } catch (e) {
-    logger.error(`💥 PROCESSING ERROR: ${lead.phone} - ${e.message}`);
     counters.incrementApiErrors();
     counters.addFailedLead(lead.phone, "processing_error", e.message);
     responses.error = { message: e.message };
-    return makeProcessResult({
-      leadId: String(lead._id),
-      phone: String(lead.phone),
-      pan: lead.pan || "",
-      status: "api_error",
-      responses,
-      success: false,
-    });
+    return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "api_error", responses, success: false });
   }
 }
 
 async function processSingleLead(client, lead) {
   try {
-    logger.info(`🔍 STARTING VALIDATION: ${lead.phone}`);
-
     const [isValid, rejectionReason, age] = validateLead(lead);
 
     if (!isValid) {
-      logger.info(`🚫 VALIDATION FAILED: ${lead.phone} - ${rejectionReason}`);
       counters.incrementTraversed();
       counters.incrementRejected();
       counters.addFailedLead(lead.phone, "validation_failed", rejectionReason);
@@ -848,18 +641,10 @@ async function processSingleLead(client, lead) {
     counters.incrementTraversed();
     return result;
   } catch (e) {
-    logger.error(`💥 THREAD ERROR: ${lead.phone} - ${e.message}`);
     counters.incrementTraversed();
     counters.incrementApiErrors();
     counters.addFailedLead(lead.phone, "thread_error", e.message);
-    return makeProcessResult({
-      leadId: String(lead._id),
-      phone: String(lead.phone),
-      pan: lead.pan || "",
-      status: "processing_error",
-      responses: { error: e.message },
-      success: false,
-    });
+    return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "processing_error", responses: { error: e.message }, success: false });
   }
 }
 
@@ -871,22 +656,13 @@ async function getLeadsBatch(skip, limit) {
       {
         $or: [
           { processed: { $exists: false } },
-          { processed: { $ne: LENDER_NAME } },
+          { processed: { $regex: `^((?!${LENDER_NAME}).)*$`, $options: "i" } },
         ],
       },
       {
         projection: {
-          name: 1,
-          gender: 1,
-          phone: 1,
-          pan: 1,
-          dob: 1,
-          employment: 1,
-          income: 1,
-          pincode: 1,
-          city: 1,
-          state: 1,
-          email: 1,
+          name: 1, gender: 1, phone: 1, pan: 1, dob: 1,
+          employment: 1, income: 1, pincode: 1, city: 1, state: 1, email: 1,
         },
       },
     )
@@ -895,57 +671,38 @@ async function getLeadsBatch(skip, limit) {
     .toArray();
 }
 
-/**
- * Mirrors ThreadPoolExecutor(max_workers=min(MAX_THREADS, len(batch))):
- * runs leads with bounded concurrency, staggering task starts by
- * THREAD_DELAY just like the Python submit loop.
- */
 async function runBatchConcurrently(client, leadsBatch) {
   const results = [];
   const concurrency = Math.min(MAX_THREADS, leadsBatch.length);
-  let nextIndex = 0; // Har worker ke pick karne ke liye next pointer index
-  let started = 0;   // Processed leads counter tracker
+  let nextIndex = 0;
+  let started = 0;
 
-  // Worker loop jo tab tak chalega jab tak batch ke saare leads khatam nahi ho jaate
   async function worker() {
     while (true) {
       const currentIndex = nextIndex++;
-      // Agar batch ke saare leads process ho gaye hain, toh exit karein
-      if (currentIndex >= leadsBatch.length) {
-        return;
-      }
+      if (currentIndex >= leadsBatch.length) return;
 
       const currentLead = leadsBatch[currentIndex];
       try {
-        // processSingleLead aur 45s timeout ke beech race karwate hain
         const result = await Promise.race([
           processSingleLead(client, currentLead),
           sleep(45000).then(() => {
             throw new Error("processSingleLead timed out after 45s");
           }),
         ]);
-        if (result) {
-          results.push(result);
-        }
+        if (result) results.push(result);
       } catch (e) {
-        logger.error(`⚠️ Future error: ${e.message}`);
         counters.incrementApiErrors();
       }
 
       started++;
-      if (started % 10 === 0) {
-        logger.info(`📦 Batch progress: ${started}/${leadsBatch.length} completed`);
-      }
     }
   }
 
-  // Stagger workers start (har worker ke shuru hone me thoda delay dete hain)
   const workers = [];
   for (let w = 0; w < concurrency; w++) {
     workers.push(worker());
-    if (w < concurrency - 1) {
-      await sleep(THREAD_DELAY);
-    }
+    if (w < concurrency - 1) await sleep(THREAD_DELAY);
   }
   await Promise.all(workers);
 
@@ -954,63 +711,56 @@ async function runBatchConcurrently(client, leadsBatch) {
 
 async function processBatch(client, leadsBatch, batchNumber) {
   const batchStart = Date.now();
-  logger.info(`🚀 STARTING BATCH ${batchNumber} with ${leadsBatch.length} leads`);
-  logger.info(`📋 Lead phones: ${leadsBatch.slice(0, 5).map((l) => l.phone).join(", ")}...`);
-
   await client.ensureToken();
-  if (!client.token) {
-    logger.error("❌ Cannot process batch - no valid token");
-    return 0;
-  }
+  if (!client.token) return 0;
 
   const results = await runBatchConcurrently(client, leadsBatch);
-
   await saveResults(results);
 
   const batchTime = (Date.now() - batchStart) / 1000;
   const successfulCount = results.filter((r) => r.success).length;
 
-  logger.info(`✅ BATCH ${batchNumber} COMPLETE`);
-  logger.info(`   📊 Success: ${successfulCount}/${leadsBatch.length}`);
-  logger.info(`   ⏱️  Time: ${batchTime.toFixed(1)}s`);
-  if (batchTime > 0) {
-    logger.info(`   🚀 Rate: ${(leadsBatch.length / batchTime).toFixed(1)} leads/sec`);
-  }
-
-  return successfulCount;
+  logger.info(`✅ BATCH ${batchNumber} COMPLETE (Success: ${successfulCount}/${leadsBatch.length}, Time: ${batchTime.toFixed(1)}s)`);
+  return results.length; // Returns total processed count in this batch
 }
 
 async function saveResults(results) {
   if (!results.length) return;
 
   try {
-    const documents = results.map((result) => ({
-      leadId: result.leadId,
-      phone: result.phone,
-      pan: result.pan,
-      status: result.status,
-      responses: result.responses,
-     createdAt: new Date().toISOString().split('T')[0]
-    }));
+    const apiDocuments = results
+      .filter((r) => r.status !== "validation_failed")
+      .map((result) => ({
+        leadId: result.leadId,
+        phone: result.phone,
+        pan: result.pan,
+        status: result.status,
+        responses: result.responses,
+        createdAt: new Date().toISOString().split("T")[0],
+      }));
 
-    await responseCol.insertMany(documents, { ordered: false });
-    logger.info(`💾 Saved ${documents.length} results to response collection`);
+    if (apiDocuments.length > 0) {
+      await responseCol.insertMany(apiDocuments, { ordered: false });
+    }
 
-    // Bulk update the source leads in leadCol (api_user) to mark them as processed
-    const bulkOps = results.map((result) => ({
-      updateOne: {
-        filter: { _id: new ObjectId(result.leadId) },
-        update: {
-          $addToSet: {
-            processed: LENDER_NAME,
-          },
+    const bulkOps = results.map((result) => {
+      let tag = LENDER_NAME;
+      if (result.status === "validation_failed" && result.responses?.validation_error) {
+        tag = `${LENDER_NAME}: skipped_${result.responses.validation_error}`;
+      } else if (result.status === "duplicate") {
+        tag = `${LENDER_NAME}: skipped_duplicate`;
+      }
+
+      return {
+        updateOne: {
+          filter: { _id: new ObjectId(result.leadId) },
+          update: { $addToSet: { processed: tag } },
         },
-      },
-    }));
+      };
+    });
 
     if (bulkOps.length > 0) {
       await leadCol.bulkWrite(bulkOps, { ordered: false });
-      logger.info(`💾 Updated ${bulkOps.length} leads in api_user with processed flag: ${LENDER_NAME}`);
     }
   } catch (e) {
     logger.error(`❌ Database save error: ${e.message}`);
@@ -1021,110 +771,53 @@ async function saveResults(results) {
 
 async function main() {
   const startTime = Date.now();
-
   await connectMongo();
 
-  logger.info("⚡ HIGH-PERFORMANCE PROCESSING STARTED");
-  logger.info(`   • Max Leads: ${MAX_LEADS}`);
-  logger.info(`   • Batch Size: ${BATCH_SIZE} (larger)`);
-  logger.info(`   • Max Threads: ${MAX_THREADS} (more)`);
-  logger.info(`   • API Delay: ${API_CALL_DELAY}ms (faster)`);
-  logger.info(`   • Target: ~80-100 leads/sec (high throughput)`);
+  logger.info("⚡ HIGH-PERFORMANCE PROCESSING STARTED (Daily Limit: 5 Lakhs)");
 
   counters.startTiming();
   const client = new FatakPayAPIClient();
 
   try {
-    logger.info("🔄 Initializing FatakPay token...");
     await client.ensureToken();
-
     if (!client.token) {
       logger.error("❌ FatakPay API client failed to initialize - no token");
       return;
     }
 
-    logger.info("✅ FatakPay API client ready");
-
-    const totalLeads = Math.min(
-      await leadCol.countDocuments(
-        {
-          $or: [
-            { processed: { $exists: false } },
-            { processed: { $ne: LENDER_NAME } },
-          ],
-        },
-        { skip: SKIP }
-      ),
-      MAX_LEADS
-    );
-    const totalBatches = Math.ceil(Math.min(totalLeads, MAX_LEADS) / BATCH_SIZE);
-    logger.info(`📊 Processing: ${totalLeads} leads in ${totalBatches} batches`);
-
-    let successfulProcessing = 0;
-    let processedLeadsCount = 0;
+    let totalProcessedToday = 0;
     let batchNum = 1;
 
-    // Har batch ko sequentially process karenge jab tak max leads reach na ho jayein
-    while (processedLeadsCount < totalLeads) {
-      // Is batch ke liye kitne leads fetch karne hain use limit calculate karenge
-      const limit = Math.min(BATCH_SIZE, totalLeads - processedLeadsCount);
-      if (limit <= 0) {
-        break;
-      }
+    while (totalProcessedToday < MAX_LEADS_DAILY) {
+      const remainingLimit = MAX_LEADS_DAILY - totalProcessedToday;
+      const currentLimit = Math.min(BATCH_SIZE, remainingLimit);
 
-      // We pass SKIP since processed leads are already filtered out dynamically
-      const leadsBatch = await getLeadsBatch(SKIP, limit);
+      const leadsBatch = await getLeadsBatch(SKIP, currentLimit);
       if (leadsBatch.length === 0) {
-        logger.info("🏁 No more leads found in the database. Exiting loop.");
+        logger.info("🏁 No more unprocessed leads found in the database. Exiting loop.");
         break;
       }
 
-      const batchSuccess = await processBatch(client, leadsBatch, batchNum);
-      successfulProcessing += batchSuccess;
+      const processedCountInBatch = await processBatch(client, leadsBatch, batchNum);
+      totalProcessedToday += processedCountInBatch;
 
-      // Stats aur progress metrics display karenge
-      const stats = counters.getStats();
-      const progressPct = totalBatches > 0 ? (batchNum / totalBatches) * 100 : 100;
+      logger.info(`📊 DAILY PROGRESS: ${totalProcessedToday}/${MAX_LEADS_DAILY} leads processed today.`);
 
-      logger.info(`📈 OVERALL PROGRESS: ${batchNum}/${totalBatches} (${progressPct.toFixed(1)}%)`);
-      logger.info(`   🚀 Current Rate: ${stats.currentRate.toFixed(1)} leads/sec`);
-      logger.info(`   ✅ Eligible: ${stats.eligibilitySuccess}`);
-      logger.info(`   ❌ Failed: ${stats.rejectedLeads + stats.apiErrors}`);
-
-      if (stats.recentSuccessful.length || stats.recentFailed.length) {
-        logger.info("   📝 Recent Activity:");
-        stats.recentSuccessful.slice(-3).forEach((s) => logger.info(`      ✅ ${s.phone}: ${s.status}`));
-        stats.recentFailed.slice(-3).forEach((f) => logger.info(`      ❌ ${f.phone}: ${f.status}`));
+      if (totalProcessedToday >= MAX_LEADS_DAILY) {
+        logger.info("🛑 Daily limit of 5,00,000 hits reached. Stopping script for today!");
+        break;
       }
 
-      // Next batch indexes update karenge
-      processedLeadsCount += leadsBatch.length;
       batchNum++;
-
-      // Next batch se pehle delay denge, par aakhri batch ke baad delay nahi denge
-      if (processedLeadsCount < totalLeads) {
-        logger.info(`⏳ Waiting ${BATCH_DELAY / 1000}s before next batch...`);
-        await sleep(BATCH_DELAY);
-      }
+      await sleep(BATCH_DELAY);
     }
 
     const totalTime = (Date.now() - startTime) / 1000;
-    const finalStats = counters.getStats();
-
-    logger.info("🎯 PROCESSING COMPLETE!");
-    logger.info("=".repeat(60));
-    logger.info("📊 FINAL STATISTICS:");
-    logger.info(`   • Total Leads: ${finalStats.traversedLeads}`);
-    logger.info(`   • Total Time: ${totalTime.toFixed(1)}s (${(totalTime / 60).toFixed(1)}m)`);
-    logger.info(`   • Average Rate: ${finalStats.currentRate.toFixed(1)} leads/sec`);
-    logger.info(`   • Eligible: ${finalStats.eligibilitySuccess}`);
-    logger.info(`   • Rejected: ${finalStats.rejectedLeads}`);
-    logger.info(`   • Duplicates: ${finalStats.duplicateLeads}`);
-    logger.info(`   • API Errors: ${finalStats.apiErrors}`);
-    logger.info("=".repeat(60));
+    logger.info("🎯 DAILY PROCESSING COMPLETE!");
+    logger.info(`   • Total Processed Today: ${totalProcessedToday}`);
+    logger.info(`   • Total Time Taken: ${totalTime.toFixed(1)}s`);
   } catch (e) {
     logger.error(`❌ Main execution error: ${e.message}`);
-    logger.error(e.stack);
   } finally {
     if (mongoClient) {
       await mongoClient.close();
