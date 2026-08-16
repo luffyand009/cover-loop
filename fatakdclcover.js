@@ -24,17 +24,17 @@ const LENDER_NAME = "fatakpayDCL";
 // Processing Configuration
 const MAX_LEADS_DAILY = 500000; // 🎯 Daily limit set to 5 Lakhs
 const SKIP = 0;
-const BATCH_SIZE = 1000;
-const MAX_THREADS = 40; // max concurrency per batch
+const BATCH_SIZE = 500;
+const MAX_THREADS = 20; // max concurrency per batch
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
 const REQUEST_TIMEOUT = 15000; // ms
 
 // Rate Limiting Configuration
-const API_CALL_DELAY = 0; // ms
-const BATCH_DELAY = 800; // ms
-const THREAD_DELAY = 300; // ms
-const MAX_REQUESTS_PER_SECOND = 5000;
+const API_CALL_DELAY = 100; // ms
+const BATCH_DELAY = 1000; // ms
+const THREAD_DELAY = 100; // ms
+const MAX_REQUESTS_PER_SECOND = 100;
 
 // Validation Configuration
 const MIN_AGE = 18;
