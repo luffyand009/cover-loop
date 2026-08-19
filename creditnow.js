@@ -8,7 +8,7 @@ require("dotenv").config();
 const MONGO_URI = "mongodb://coverloopAdmin:coverloops_runbasedvisahl@72.61.241.6:27017/coverloop?authSource=coverloop";
 
 const DB_NAME = "coverloop";
-const LEAD_COLLECTION = "keshvadb";
+const LEAD_COLLECTION = "payme";
 const RESPONSE_COLLECTION = "creditt_responses";
 const LEAD_API_URL = "https://agency.ctpl.live/lead/ingest/cover_mantra";
 const LENDER_NAME = "cover_mantra";
