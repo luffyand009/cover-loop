@@ -11,7 +11,7 @@ const DB_NAME = "coverloop";
 const LEAD_COLLECTION = "payme";
 const RESPONSE_COLLECTION = "creditt_responses";
 const LEAD_API_URL = "https://agency.ctpl.live/lead/ingest/cover_mantra";
-const LENDER_NAME = "cover_mantra";
+const LENDER_NAME = "creditplus";
 
 // ------------ LOAD PINCODES FROM EXCEL ------------ //
 const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "creditnow.xlsx");
@@ -108,8 +108,11 @@ async function processLead(item, leadCol, responseCol) {
 
     const isSuccess = formattedApiResponse.message === "SUCCESS" || formattedApiResponse.message === "DUPLICATE";
 
+    // ✅ Added name and pan here
     await responseCol.insertOne({
       phone: item.phone,
+      name: item.name || "",
+      pan: item.pan || "",
       status: isSuccess ? formattedApiResponse.message : "FAILED",
       api_response: formattedApiResponse,
       createdAt: new Date().toISOString().slice(0, 10)
@@ -134,8 +137,11 @@ async function processLead(item, leadCol, responseCol) {
         };
 
         if (formattedApiResponse.message === "DUPLICATE") {
+          // ✅ Added name and pan here too for duplicates from error responses
           await responseCol.insertOne({
             phone: item.phone,
+            name: item.name || "",
+            pan: item.pan || "",
             status: "DUPLICATE",
             api_response: formattedApiResponse,
             createdAt: new Date().toISOString().slice(0, 10)
