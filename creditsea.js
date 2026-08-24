@@ -106,6 +106,49 @@ function loadValidPincodes() {
   }
 }
 
+// Flexible Date Parser to convert various formats (DD-MM-YYYY, MM/DD/YYYY, YYYY-MM-DD, etc.) into a valid Date object
+function parseFlexibleDate(dateStr) {
+  if (!dateStr) return null;
+  
+  // If it's already a Date object
+  if (dateStr instanceof Date) return isNaN(dateStr.getTime()) ? null : dateStr;
+
+  const str = String(dateStr).trim();
+
+  // Match pattern like YYYY-MM-DD or YYYY/MM/DD
+  const isoMatch = str.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (isoMatch) {
+    const [, y, m, d] = isoMatch;
+    const date = new Date(Number(y), Number(m) - 1, Number(d));
+    return isNaN(date.getTime()) ? null : date;
+  }
+
+  // Match pattern like DD-MM-YYYY, MM-DD-YYYY, DD/MM/YYYY etc.
+  const partsMatch = str.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  if (partsMatch) {
+    const [, p1, p2, y] = partsMatch;
+    let month, day;
+
+    // Heuristic: If the first part is > 12, it must be the day (DD-MM-YYYY format)
+    if (Number(p1) > 12) {
+      day = Number(p1);
+      month = Number(p2);
+    } else {
+      // Default standard fallback assuming DD-MM-YYYY or MM-DD-YYYY
+      // Adjust if your source format specifically puts Month first for values <= 12
+      day = Number(p1);
+      month = Number(p2);
+    }
+
+    const date = new Date(Number(y), month - 1, day);
+    return isNaN(date.getTime()) ? null : date;
+  }
+
+  // Fallback to native JS Date parse
+  const fallbackDate = new Date(str);
+  return isNaN(fallbackDate.getTime()) ? null : fallbackDate;
+}
+
 // 1. Dedupe API Call
 async function checkDedupe(phone) {
   try {
@@ -125,12 +168,12 @@ async function checkDedupe(phone) {
 // 2. Lead Creation API Call
 async function submitLeadToCreditSea(user) {
   try {
+    const parsedDob = parseFlexibleDate(user.dob);
     let dobFormatted = "";
-    if (user.dob) {
-      const date = new Date(user.dob);
-      const dd = String(date.getDate()).padStart(2, "0");
-      const mm = String(date.getMonth() + 1).padStart(2, "0");
-      const yyyy = date.getFullYear();
+    if (parsedDob) {
+      const dd = String(parsedDob.getDate()).padStart(2, "0");
+      const mm = String(parsedDob.getMonth() + 1).padStart(2, "0");
+      const yyyy = parsedDob.getFullYear();
       dobFormatted = `${mm}-${dd}-${yyyy}`;
     }
 
@@ -268,41 +311,53 @@ async function main() {
     console.log(`📊 Target Collection: "${UserDB.collection.name}"`);
     console.log(`📊 Total documents in source collection: ${totalDocs}`);
 
-    // Age boundaries for 21 to 56 (Current year: 2026)
+    // Age boundaries for 21 to 56 (Current year: 2026) -> Birth year bounds: 1970 to 2005
     const currentYear = 2026;
-    const maxBirthDate = new Date(`${currentYear - 21}-12-31`);
-    const minBirthDate = new Date(`${currentYear - 56}-01-01`);
+    const minYear = currentYear - 56; // 1970
+    const maxYear = currentYear - 21; // 2005
 
     while (totalRegisteredSuccessfully < TARGET_SUCCESS) {
+      // Fetch chunks of unprocessed profiles
       const users = await UserDB.find({
-        $and: [
-          {
-            $or: [
-              { processed: { $exists: false } },
-              { processed: { $ne: LENDER_NAME } },
-            ],
-          },
-          // Filter: Employment must be Salaried
-          { employment: { $regex: /^salaried$/i } },
-          // Filter: Income >= 20000 (handles numeric or numeric string fields stored in DB)
-          { 
-            $expr: { 
-              $gte: [{ $toInt: { $ifNull: ["$income", "0"] } }, 20000] 
-            } 
-          },
-          // Filter: Age between 21 and 56 using DOB
-          { dob: { $gte: minBirthDate, $lte: maxBirthDate } }
+        $or: [
+          { processed: { $exists: false } },
+          { processed: { $ne: LENDER_NAME } },
         ],
       })
-        .limit(BATCH_SIZE)
+        .limit(BATCH_SIZE * 5)
         .lean();
 
       if (users.length === 0) {
-        console.log("🏁 No more unprocessed documents found matching criteria.");
+        console.log("🏁 No more unprocessed documents found.");
         break;
       }
 
-      const batchSuccess = await processBatch(users, validPincodes);
+      // Filter in-memory with flexible date parsing and income checks
+      const filteredUsers = users.filter((user) => {
+        // 1. Employment check (Salaried, case-insensitive)
+        const isSalaried = user.employment && String(user.employment).toLowerCase() === "salaried";
+        if (!isSalaried) return false;
+
+        // 2. Income check (>= 20000)
+        const userIncome = Number(user.income || 0);
+        if (userIncome < 20000) return false;
+
+        // 3. Date of Birth & Age check (21 to 56 years old based on birth year)
+        const parsedDate = parseFlexibleDate(user.dob);
+        if (!parsedDate) return false;
+
+        const birthYear = parsedDate.getFullYear();
+        if (birthYear < minYear || birthYear > maxYear) return false;
+
+        return true;
+      }).slice(0, BATCH_SIZE);
+
+      if (filteredUsers.length === 0) {
+        console.log("⏳ Fetched a chunk, but none matched the strict criteria. Scanning next batch...");
+        continue;
+      }
+
+      const batchSuccess = await processBatch(filteredUsers, validPincodes);
       totalRegisteredSuccessfully += batchSuccess;
 
       console.log(
