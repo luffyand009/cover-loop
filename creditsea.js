@@ -5,8 +5,8 @@ const axios = require("axios");
 require("dotenv").config();
 
 // Configuration
-const BATCH_SIZE = 2000;
-const TARGET_SUCCESS = 50000;
+const BATCH_SIZE = 100;
+const TARGET_SUCCESS = 1000;
 const LENDER_NAME = "creditsea"; // Tracker label for main collection
 
 const BASE_URL = "https://backend.creditsea.com/api/v1";
@@ -16,17 +16,21 @@ const CREATE_LEAD_ENDPOINT = "leads/create-lead-dsa";
 const CREDITSEA_SOURCE_ID = 62687494;
 const CREDITSEA_DEDUPE_API_KEY = "eyJhbGciOiJIUzI1NiJ9.eyJrZXkiOiJhcGkifQ.k9X2LpQ7sT4Zm1A";
 
-const RESPONSE_COLLECTION_NAME = "creditseaLeadResponses";
-const MONGODB_URI = process.env.MONGODB_read;
+// Database & Collections Configuration
+const DB_NAME = "coverloop";
+const LEAD_COLLECTION = "keshvadb";
+const RESPONSE_COLLECTION_NAME = "creditseaRespnose";
+
+const MONGODB_URI = process.env.MONGO_URI_COVER;
 
 if (!MONGODB_URI) {
   console.error("❌ ERROR: MongoDB connection URI is not defined!");
   process.exit(1);
 }
 
-// Database Connection
+// Database Connection with explicit dbName
 mongoose
-  .connect(MONGODB_URI)
+  .connect(MONGODB_URI, { dbName: DB_NAME })
   .then(() => {
     console.log("✅ MongoDB Connected Successfully");
     const conn = mongoose.connection;
@@ -40,7 +44,7 @@ mongoose
 // Main Source Collection
 const UserDB = mongoose.model(
   "api_user",
-  new mongoose.Schema({}, { collection: "api_user", strict: false })
+  new mongoose.Schema({}, { collection: LEAD_COLLECTION, strict: false })
 );
 
 // Separate Response Collection
@@ -77,20 +81,16 @@ function loadValidPincodes() {
     const workbook = xlsx.readFile(PINCODE_FILE_PATH);
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
-    
-    // Convert sheet to an array of objects using headers
     const data = xlsx.utils.sheet_to_json(worksheet);
 
     const pincodes = new Set();
     
     data.forEach((row) => {
-      // Look for 'pinCode' or common variations (case-insensitive search)
       const pinKey = Object.keys(row).find(
-        (key) => key.trim().toLowerCase() === 'pincode'
+        (key) => key.trim().toLowerCase() === 'pincode' || key.trim().toLowerCase() === 'pin'
       );
 
-      if (pinKey && row[pinKey]) {
-        // Clean and format pincode (e.g., handles trailing spaces or numbers)
+      if (pinKey && row[pinKey] !== undefined) {
         const cleanPin = String(row[pinKey]).trim();
         if (cleanPin) {
           pincodes.add(cleanPin);
@@ -143,7 +143,7 @@ async function submitLeadToCreditSea(user) {
       gender: user.gender ? String(user.gender).toLowerCase() : "male",
       pincode: String(user.pincode || "").trim(),
       income: String(user.income || "0"),
-      employmentType: user.employment || "Salaried", // Fixed key name spelling
+      employmentType: user.employment || "Salaried",
     };
 
     const response = await axios.post(
@@ -172,6 +172,7 @@ async function saveLeadResponse(user, apiResponse, status) {
       api_response: apiResponse,
       createdAt: new Date().toISOString().slice(0, 10),
     });
+    console.log(`💾 Response successfully logged for phone: ${user.phone}`);
   } catch (err) {
     console.error(`❌ Failed to save lead response for ${user.phone || "unknown"}:`, err.message);
   }
@@ -216,7 +217,6 @@ async function processBatch(users, validPincodes) {
         }
 
         await saveLeadResponse(userDoc, apiResult, finalStatus);
-        console.log(`💾 Response logged to "${RESPONSE_COLLECTION_NAME}" for user: ${phone}`);
 
         await UserDB.updateOne(
           { _id: userDoc._id },
