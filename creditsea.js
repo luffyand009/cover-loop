@@ -268,18 +268,37 @@ async function main() {
     console.log(`📊 Target Collection: "${UserDB.collection.name}"`);
     console.log(`📊 Total documents in source collection: ${totalDocs}`);
 
+    // Age boundaries for 21 to 56 (Current year: 2026)
+    const currentYear = 2026;
+    const maxBirthDate = new Date(`${currentYear - 21}-12-31`);
+    const minBirthDate = new Date(`${currentYear - 56}-01-01`);
+
     while (totalRegisteredSuccessfully < TARGET_SUCCESS) {
       const users = await UserDB.find({
-        $or: [
-          { processed: { $exists: false } },
-          { processed: { $ne: LENDER_NAME } },
+        $and: [
+          {
+            $or: [
+              { processed: { $exists: false } },
+              { processed: { $ne: LENDER_NAME } },
+            ],
+          },
+          // Filter: Employment must be Salaried
+          { employment: { $regex: /^salaried$/i } },
+          // Filter: Income >= 20000 (handles numeric or numeric string fields stored in DB)
+          { 
+            $expr: { 
+              $gte: [{ $toInt: { $ifNull: ["$income", "0"] } }, 20000] 
+            } 
+          },
+          // Filter: Age between 21 and 56 using DOB
+          { dob: { $gte: minBirthDate, $lte: maxBirthDate } }
         ],
       })
         .limit(BATCH_SIZE)
         .lean();
 
       if (users.length === 0) {
-        console.log("🏁 No more unprocessed documents found.");
+        console.log("🏁 No more unprocessed documents found matching criteria.");
         break;
       }
 
