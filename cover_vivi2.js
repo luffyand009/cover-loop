@@ -5,8 +5,8 @@ require("dotenv").config();
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "keshvadb";
-const RESPONSE_COLLECTION = "cover_vivi";
+const LEAD_COLLECTION = "keshva";
+const RESPONSE_COLLECTION = "cover_vivi2";
 
 const ACCESS_TOKEN_URL = "https://api.flexsalary.com/apiv1/api/AccessToken/Post";
 const LEAD_API_URL = "https://api.flexsalary.com/apiv1/api/LeadCustomer/Post";
@@ -18,9 +18,8 @@ const LENDER_NAME = "flexsalary";
 
 // ------------ CONTROL ------------ //
 
-const MAX_LEADS = 5000000;
-const SKIP = 1;
-const BATCH_SIZE = 500;
+const MAX_LEADS = 5000;
+const BATCH_SIZE = 100;
 const MAX_WORKERS = 7;
 const REQUEST_TIMEOUT = 30000; // ms
 const BATCH_DELAY = 1000; // ms
@@ -68,7 +67,6 @@ function splitName(doc) {
   const first = parts[0] || "NA";
   let last = parts.length > 1 ? parts.slice(1).join(" ") : "";
   
-  // 💡 सुरक्षा घेरा: अगर सिंगल नाम है और कोई सरनेम नहीं मिला, तो "NA" भेजें
   if (!last) {
     last = "NA"; 
   }
@@ -90,7 +88,6 @@ function formatDob(dob) {
   if (typeof dob === "string") {
     dob = dob.trim();
 
-    // ISO string: 1985-02-28T00:00:00.000Z
     if (dob.includes("T")) {
       dob = dob.split("T")[0];
     }
@@ -123,6 +120,31 @@ function formatDob(dob) {
   return null;
 }
 
+function calculateAge(dob) {
+  const formattedDobStr = formatDob(dob);
+  if (!formattedDobStr) return null;
+
+  const parts = formattedDobStr.split("/");
+  if (parts.length !== 3) return null;
+
+  const day = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const year = parseInt(parts[2], 10);
+
+  const birthDate = new Date(year, month, day);
+  if (isNaN(birthDate.getTime())) return null;
+
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+  const m = today.getMonth() - birthDate.getMonth();
+  
+  if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
+    age--;
+  }
+
+  return age;
+}
+
 function mapGender(gender) {
   const map = { male: 0, female: 1, other: 2 };
   return map[(gender || "").toLowerCase()] ?? 0;
@@ -132,37 +154,51 @@ function mapIncomeType(emp) {
   return emp && emp.toLowerCase() === "self employed" ? 2 : 6;
 }
 
+function isValidPincode(pincode) {
+  if (!pincode) return false;
+  const pinStr = String(pincode).trim();
+  return /^[1-9][0-9]{5}$/.test(pinStr);
+}
+
+// Detailed shouldSkip logic incorporating Age, Pincode, Income, Employment & State Checks
 function shouldSkip(lead) {
   // 1. Basic required fields check
-  const required = ["phone", "pan", "dob", "gender", "name"];
+  const required = ["phone", "pan", "dob", "gender", "name", "pincode", "income", "employment", "state"];
   for (const field of required) {
-    if (!lead[field]) return true;
+    if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
-  if (formatDob(lead.dob) === null) return true;
+
+  // 2. Validate DOB & Age Check (Must be between 21 and 60 years)
+  const age = calculateAge(lead.dob);
+  if (age === null) return "INVALID_DOB";
+  if (age < 21 || age > 60) return "OUT_OF_AGE_RANGE";
   
-  // 2. Check if already processed
+  // 3. Check if already processed
   if (lead.processed && Array.isArray(lead.processed)) {
     const hasAlreadyProcessed = lead.processed.some(
-      (lender) => String(lender).toLowerCase() === LENDER_NAME.toLowerCase()
+      (lender) => String(lender).toLowerCase().startsWith(LENDER_NAME.toLowerCase())
     );
-    if (hasAlreadyProcessed) return true;
+    if (hasAlreadyProcessed) return "ALREADY_PROCESSED";
   }
 
-  // 3. New Validation: Employment must be "salaried" (Case-Insensitive)
+  // 4. Employment Validation
   const emp = (lead.employment || "").trim().toLowerCase();
-  if (emp !== "salaried") return true;
+  if (emp === "self employed" || emp === "selfemployed" || emp === "self-employed") {
+    return "SELF_EMPLOYED";
+  }
+  if (emp !== "salaried") return "INVALID_EMPLOYMENT";
 
-  // 4. New Validation: Income must be >= 25000 (Parses string correctly)
+  // 5. Income Validation (Must be >= 25000)
   const incomeVal = parseFloat(lead.income || 0);
-  if (isNaN(incomeVal) || incomeVal < 25000) return true;
+  if (isNaN(incomeVal) || incomeVal < 25000) return "LOW_INCOME";
 
-  // 5. New Validation: State Exclusions (Case-Insensitive)
+  // 6. Pincode Validation (Must be a valid 6-digit Indian Pincode starting with 1-9)
+  if (!isValidPincode(lead.pincode)) return "INVALID_PINCODE";
+
+  // 7. State Exclusions
   const state = (lead.state || "").trim().toLowerCase();
-  
-  // Exclude Jammu & Kashmir (Covering multiple variations)
   const isJK = state.includes("jammu") || state.includes("kashmir") || state === "j&k" || state === "j and k";
   
-  // Exclude North East States (7 Sisters + Sikkim)
   const northEastStates = [
     "arunachal pradesh",
     "assam",
@@ -175,12 +211,12 @@ function shouldSkip(lead) {
   ];
   const isNorthEast = northEastStates.includes(state);
 
-  if (isJK || isNorthEast) return true;
+  if (isJK || isNorthEast) return "EXCLUDED_STATE";
   
   return false;
 }
 
-// ---------------- TOKEN MANAGMENT WITH AUTO REFRESH ---------------- //
+// ---------------- TOKEN MANAGEMENT WITH AUTO REFRESH ---------------- //
 
 async function getAccessToken() {
   const currentTime = Date.now();
@@ -207,7 +243,6 @@ async function getAccessToken() {
 // ---------------- PAYLOAD ---------------- //
 
 function buildPayload(doc) {
-  // यहाँ अब doc.name की जगह पूरा doc पास करें
   const [first, last] = splitName(doc); 
   const dobFormatted = formatDob(doc.dob);
 
@@ -219,7 +254,7 @@ function buildPayload(doc) {
 
     PersonerDetails: {
       FirstName: first,
-      LastName: last, // अब यहाँ सही 'Chovatiya' चला जाएगा
+      LastName: last,
       Email: doc.email || "NA",
       PhoneNumber: doc.phone,
       DateOfBirth: dobFormatted,
@@ -229,7 +264,7 @@ function buildPayload(doc) {
 
     CustomerAddressDetails: {
       ResidenceType: 1,
-      PinCode: doc.pincode,
+      PinCode: String(doc.pincode).trim(),
     },
 
     CustomerIncomeDetails: {
@@ -332,7 +367,6 @@ async function runWithConcurrencyLimit(items, limit, fn) {
   return successCount;
 }
 
-// Dynamics headers injection inside batch injection to maintain updated tokens
 async function processBatch(batch) {
   const token = await getAccessToken(); 
   const headers = {
@@ -352,32 +386,59 @@ function sleep(ms) {
 }
 
 async function processLeads() {
-  const cursor = leadCol
-    .find({
-      $or: [
-        { processed: { $exists: false } },
-        { processed: { $ne: LENDER_NAME } },
-      ],
-    })
-    .skip(SKIP)
-    .limit(MAX_LEADS);
+  log("INFO", "🔍 Fetching unprocessed leads from MongoDB...");
+
+  const query = {
+    $or: [
+      { processed: { $exists: false } },
+      { processed: { $regex: "^((?!flexsalary).)*$", $options: "i" } }
+    ]
+  };
+
+  const cursor = leadCol.find(query).limit(MAX_LEADS);
 
   let total = 0;
   let processed = 0;
   let skipped = 0;
+  
   let batch = [];
+  let skippedBulkOps = [];
 
   for await (const lead of cursor) {
     total++;
 
-    if (shouldSkip(lead)) {
+    if (total % 1000 === 0) {
+      log("INFO", `Scanned ${total} records... (Queue for API: ${batch.length}, Total Skipped: ${skipped})`);
+    }
+
+    const skipReason = shouldSkip(lead);
+
+    if (skipReason) {
+      if (skipReason === "ALREADY_PROCESSED") continue;
+
       skipped++;
+
+      const skipTag = `${LENDER_NAME}: skipped_${skipReason}`;
+
+      skippedBulkOps.push({
+        updateOne: {
+          filter: { _id: lead._id },
+          update: { $addToSet: { processed: skipTag } }
+        }
+      });
+
+      if (skippedBulkOps.length >= BATCH_SIZE) {
+        await leadCol.bulkWrite(skippedBulkOps);
+        skippedBulkOps = [];
+      }
+
       continue;
     }
 
     batch.push(lead);
 
     if (batch.length === BATCH_SIZE) {
+      log("INFO", `🚀 Processing batch of ${batch.length} leads to API...`);
       processed += await processBatch(batch);
       batch = [];
       await sleep(BATCH_DELAY);
@@ -385,13 +446,19 @@ async function processLeads() {
   }
 
   if (batch.length) {
+    log("INFO", `🚀 Processing final batch of ${batch.length} leads to API...`);
     processed += await processBatch(batch);
   }
 
+  if (skippedBulkOps.length > 0) {
+    await leadCol.bulkWrite(skippedBulkOps);
+    skippedBulkOps = [];
+  }
+
   log("INFO", "----- SUMMARY -----");
-  log("INFO", `TOTAL FETCHED : ${total}`);
-  log("INFO", `PROCESSED     : ${processed}`);
-  log("INFO", `SKIPPED       : ${skipped}`);
+  log("INFO", `TOTAL UNPROCESSED FETCHED : ${total}`);
+  log("INFO", `PROCESSED (SUCCESS/API)   : ${processed}`);
+  log("INFO", `TOTAL SKIPPED (UPDATED DB): ${skipped}`);
 }
 
 // ---------------- RUN ---------------- //
