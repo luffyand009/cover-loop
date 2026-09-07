@@ -5,7 +5,7 @@ const XLSX = require("xlsx");
 require("dotenv").config();
 
 // Hardcoded MongoDB URI
-const MONGO_URI = "mongodb://coverloopAdmin:coverloops_runbasedvisahl@72.61.241.6:27017/coverloop?authSource=coverloop";
+const MONGO_URI = process.env.MONGO_URI_COVER;
 
 const DB_NAME = "coverloop";
 const LEAD_COLLECTION = "payme";
