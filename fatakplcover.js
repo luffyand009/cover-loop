@@ -16,16 +16,21 @@ const FATAKPAY_BASE_URL = "https://onboardingapi.fatakpay.com";
 const FATAKPAY_TOKEN_URL = `${FATAKPAY_BASE_URL}/external-api/v1/create-user-token`;
 const FATAKPAY_ELIGIBILITY_URL = `${FATAKPAY_BASE_URL}/external-api/v1/emi-insurance-eligibility`;
 
-const MONGO_URI_COVER = process.env.MONGO_URI_COVER;
+const MONGO_URI = process.env.MONGO_URI_COVER;
+const DB_NAME = "coverloop";
+
+const LEAD_COLLECTION = "py";
+const RESPONSE_COLLECTION = "fatakpl";
+
 const FATAKPAY_USERNAME = "CoverMantra";
 const FATAKPAY_PASSWORD = "cdcbb765b95f0cf06d0f";
 const LENDER_NAME = "fatakpayPl";
 
 // Processing Configuration
-const MAX_LEADS_DAILY = 500000; // 🎯 Strict Daily Limit: 5 Lakhs
+const MAX_LEADS_DAILY = 50000; // 🎯 Strict Daily Limit: 5 Lakhs
 const SKIP = 0;
-const BATCH_SIZE = 200;       // 👈 500 से घटाकर 200 किया ताकि सर्वर पर लोड कम हो
-const MAX_THREADS = 5;        // 👈 10 से घटाकर 5 किया (429 एरर से पूरी तरह बचने के लिए)
+const BATCH_SIZE = 500;       // 👈 500 से घटाकर 200 किया ताकि सर्वर पर लोड कम हो
+const MAX_THREADS = 10;        // 👈 10 से घटाकर 5 किया (429 एरर से पूरी तरह बचने के लिए)
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
 const REQUEST_TIMEOUT = 15000; // ms
@@ -68,11 +73,14 @@ let leadCol;
 let responseCol;
 
 async function connectMongo() {
-  mongoClient = new MongoClient(MONGO_URI_COVER);
+  if (!MONGO_URI) {
+    throw new Error("MONGO_URI_COVER is not defined in environment variables!");
+  }
+  mongoClient = new MongoClient(MONGO_URI);
   await mongoClient.connect();
-  const db = mongoClient.db();
-  leadCol = db.collection("keshvadb");
-  responseCol = db.collection("fatakpl");
+  const db = mongoClient.db(DB_NAME);
+  leadCol = db.collection(LEAD_COLLECTION);
+  responseCol = db.collection(RESPONSE_COLLECTION);
   logger.info("✅ Connected to MongoDB");
 }
 

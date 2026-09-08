@@ -16,15 +16,20 @@ const FATAKPAY_BASE_URL = "https://onboardingapi.fatakpay.com";
 const FATAKPAY_TOKEN_URL = `${FATAKPAY_BASE_URL}/external-api/v1/create-user-token`;
 const FATAKPAY_ELIGIBILITY_URL = `${FATAKPAY_BASE_URL}/external-api/v1/emi-insurance-eligibility`;
 
-const MONGO_URI_COVER = process.env.MONGO_URI_COVER;
+const MONGO_URI = process.env.MONGO_URI_COVER;
+const DB_NAME = "coverloop";
+
+const LEAD_COLLECTION = "py";
+const RESPONSE_COLLECTION = "fatakdcl";
+
 const FATAKPAY_USERNAME = "CoverMantra";
 const FATAKPAY_PASSWORD = "cdcbb765b95f0cf06d0f";
 const LENDER_NAME = "fatakpayDCL";
 
 // Processing Configuration
-const MAX_LEADS_DAILY = 500000; // 🎯 Strict Daily Limit: 5 Lakhs
+const MAX_LEADS_DAILY = 50000; // 🎯 Strict Daily Limit: 5 Lakhs
 const SKIP = 0;
-const BATCH_SIZE = 200;       
+const BATCH_SIZE = 500;       
 const MAX_THREADS = 5;        // 429 एरर से बचने के लिए थ्रेड्स कम रखे गए हैं
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
@@ -68,11 +73,14 @@ let leadCol;
 let responseCol;
 
 async function connectMongo() {
-  mongoClient = new MongoClient(MONGO_URI_COVER);
+  if (!MONGO_URI) {
+    throw new Error("MONGO_URI_COVER is not defined in environment variables!");
+  }
+  mongoClient = new MongoClient(MONGO_URI);
   await mongoClient.connect();
-  const db = mongoClient.db();
-  leadCol = db.collection("keshvadb");
-  responseCol = db.collection("fatakdcl");
+  const db = mongoClient.db(DB_NAME);
+  leadCol = db.collection(LEAD_COLLECTION);
+  responseCol = db.collection(RESPONSE_COLLECTION);
   logger.info("✅ Connected to MongoDB");
 }
 
@@ -535,7 +543,6 @@ async function saveResults(results) {
       await responseCol.insertMany(apiDocuments, { ordered: false });
     }
 
-    // 🎯 पुराना टैग हटाकर केवल एक सिंगल टैग रखने का लॉजिक
     for (const result of results) {
       let tag = LENDER_NAME;
       if (result.status === "validation_failed" && result.responses?.validation_error) {
