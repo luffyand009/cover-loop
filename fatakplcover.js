@@ -26,20 +26,19 @@ const FATAKPAY_USERNAME = "CoverMantra";
 const FATAKPAY_PASSWORD = "cdcbb765b95f0cf06d0f";
 const LENDER_NAME = "fatakpayPl";
 
-// Processing Configuration
-const MAX_LEADS_DAILY = 50000; // 🎯 Strict Daily Limit: 5 Lakhs
+// Processing Configuration (5 Lakh limit removed & speed optimized)
 const SKIP = 0;
-const BATCH_SIZE = 500;       // 👈 500 से घटाकर 200 किया ताकि सर्वर पर लोड कम हो
-const MAX_THREADS = 10;        // 👈 10 से घटाकर 5 किया (429 एरर से पूरी तरह बचने के लिए)
+const BATCH_SIZE = 1000;      // 👈 Batch size increased for faster processing
+const MAX_THREADS = 25;       // 👈 Increased threads for high-speed concurrent hits
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
 const REQUEST_TIMEOUT = 15000; // ms
 
-// Rate Limiting Configuration (धीमी और सुरक्षित गति)
-const API_CALL_DELAY = 250;   // ms
-const BATCH_DELAY = 2000;     // ms
-const THREAD_DELAY = 150;     // ms
-const MAX_REQUESTS_PER_SECOND = 20;
+// Rate Limiting Configuration (Optimized for speed)
+const API_CALL_DELAY = 50;    // ms (Reduced delay)
+const BATCH_DELAY = 500;      // ms (Reduced delay)
+const THREAD_DELAY = 20;      // ms (Reduced delay)
+const MAX_REQUESTS_PER_SECOND = 100; // Increased limit for faster throughput
 
 // Validation Configuration
 const MIN_AGE = 18;
@@ -193,7 +192,7 @@ class FatakPayAPIClient {
           this.tokenExpiry = new Date(Date.now() + 55 * 60 * 1000);
           return;
         }
-        if (attempt < 2) await sleep(2000);
+        if (attempt < 2) await sleep(1000);
       }
     } finally {
       unlock();
@@ -213,7 +212,7 @@ class FatakPayAPIClient {
           counters.incrementTokenRegenerations();
           return true;
         }
-        await sleep(1000);
+        await sleep(500);
       }
       counters.incrementTokenErrors();
       return false;
@@ -452,7 +451,15 @@ async function processSingleLead(client, lead) {
     if (!isValid) {
       counters.incrementTraversed();
       counters.incrementRejected();
-      return makeProcessResult({ leadId: String(lead._id), phone: String(lead.phone), pan: lead.pan || "", status: "validation_failed", responses: { validation_error: rejectionReason, age }, success: false });
+      // 👈 Validation failed leads will now be recorded as skipped in fatakpl
+      return makeProcessResult({ 
+        leadId: String(lead._id), 
+        phone: String(lead.phone), 
+        pan: lead.pan || "", 
+        status: `skipped_${rejectionReason}`, 
+        responses: { validation_error: rejectionReason, age }, 
+        success: false 
+      });
     }
 
     await client.ensureToken();
@@ -497,7 +504,7 @@ async function runBatchConcurrently(client, leadsBatch) {
       try {
         const result = await Promise.race([
           processSingleLead(client, currentLead),
-          sleep(45000).then(() => { throw new Error("processSingleLead timed out after 45s"); }),
+          sleep(30000).then(() => { throw new Error("processSingleLead timed out after 30s"); }),
         ]);
         if (result) results.push(result);
       } catch (e) {
@@ -528,26 +535,26 @@ async function processBatch(client, leadsBatch, batchNumber) {
 async function saveResults(results) {
   if (!results.length) return;
   try {
-    const apiDocuments = results
-      .filter((r) => r.status !== "validation_failed")
-      .map((result) => ({
-        leadId: result.leadId,
-        phone: result.phone,
-        pan: result.pan,
-        status: result.status,
-        responses: result.responses,
-        createdAt: new Date().toISOString().split("T")[0],
-      }));
+    // 👈 Now saving ALL results (including validation/skipped leads) into fatakpl response collection
+    const apiDocuments = results.map((result) => ({
+      leadId: result.leadId,
+      phone: result.phone,
+      pan: result.pan,
+      status: result.status,
+      responses: result.responses,
+      createdAt: new Date().toISOString().split("T")[0],
+    }));
 
     if (apiDocuments.length > 0) {
       await responseCol.insertMany(apiDocuments, { ordered: false });
     }
 
-    // 🎯 पुराना टैग हटाकर केवल एक सिंगल टैग रखने का लॉजिक
+    // 🎯 Update lead collection with single clean tag
     for (const result of results) {
       let tag = LENDER_NAME;
-      if (result.status === "validation_failed" && result.responses?.validation_error) {
-        tag = `${LENDER_NAME}: skipped_${result.responses.validation_error}`;
+      if (result.status.startsWith("skipped_")) {
+        const skipReason = result.status.replace("skipped_", "");
+        tag = `${LENDER_NAME}: skipped_${skipReason}`;
       } else if (result.status === "duplicate") {
         tag = `${LENDER_NAME}: skipped_duplicate`;
       }
@@ -576,7 +583,7 @@ async function main() {
   const startTime = Date.now();
   await connectMongo();
 
-  logger.info("⚡ HIGH-PERFORMANCE PROCESSING STARTED (Strict Daily Limit: 5 Lakhs)");
+  logger.info("⚡ HIGH-SPEED UNRESTRICTED PROCESSING STARTED");
   counters.startTiming();
   const client = new FatakPayAPIClient();
 
@@ -587,41 +594,29 @@ async function main() {
       return;
     }
 
-    let totalProcessedToday = 0;
+    let totalProcessedOverall = 0;
     let batchNum = 1;
 
-    while (totalProcessedToday < MAX_LEADS_DAILY) {
-      if (totalProcessedToday >= MAX_LEADS_DAILY) {
-        logger.info("🛑 Daily limit of 5,00,000 reached. Stopping execution.");
-        break;
-      }
-
-      const remainingLimit = MAX_LEADS_DAILY - totalProcessedToday;
-      const currentLimit = Math.min(BATCH_SIZE, remainingLimit);
-
-      const leadsBatch = await getLeadsBatch(SKIP, currentLimit);
+    // 👈 Infinite loop running until all unprocessed leads are finished (No 5 Lakh limit restriction)
+    while (true) {
+      const leadsBatch = await getLeadsBatch(SKIP, BATCH_SIZE);
       if (leadsBatch.length === 0) {
         logger.info("🏁 No more unprocessed leads found in the database. Exiting loop.");
         break;
       }
 
       const processedCountInBatch = await processBatch(client, leadsBatch, batchNum);
-      totalProcessedToday += processedCountInBatch;
+      totalProcessedOverall += processedCountInBatch;
 
-      logger.info(`📊 DAILY PROGRESS: ${totalProcessedToday}/${MAX_LEADS_DAILY} leads processed today.`);
-
-      if (totalProcessedToday >= MAX_LEADS_DAILY) {
-        logger.info("🛑 Daily limit of 5,00,000 hits reached. Stopping script for today!");
-        break;
-      }
+      logger.info(`📊 TOTAL PROCESSED SO FAR: ${totalProcessedOverall}`);
 
       batchNum++;
       await sleep(BATCH_DELAY);
     }
 
     const totalTime = (Date.now() - startTime) / 1000;
-    logger.info("🎯 DAILY PROCESSING COMPLETE!");
-    logger.info(`   • Total Processed Today: ${totalProcessedToday}`);
+    logger.info("🎯 PROCESSING COMPLETE!");
+    logger.info(`   • Total Processed: ${totalProcessedOverall}`);
     logger.info(`   • Total Time Taken: ${totalTime.toFixed(1)}s`);
   } catch (e) {
     logger.error(`❌ Main execution error: ${e.message}`);
