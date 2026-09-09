@@ -117,12 +117,20 @@ async function processLead(lead, headers) {
       log("WARN", `Customer already exists for ${mobile}. Skipping Lead Push.`);
       
       await responseCol.insertOne({
+        name: "CashMySalary",
+        response: {
+          Leadcredit: {
+            dedupe: {
+              success: verifyData.success || false,
+              message: verifyData.message || "",
+              fullResponse: verifyData,
+              createdAt: new Date().toISOString()
+            }
+          }
+        },
         phone: mobile,
         pan: pancard,
-        name: lead.name || "",
-        status: "EXISTS",
-        api_response: verifyData,
-        createdAt: new Date().toISOString().slice(0, 10),
+        status: "EXISTS"
       });
 
       await leadCol.updateOne(
@@ -166,15 +174,34 @@ async function processLead(lead, headers) {
 
     const isSuccess = decision === "Approve" || decision === "Review" || apiResponse.success === true;
 
+    // 🎯 Nested Structure Matching Compass Screenshot Format
     await responseCol.insertOne({
+      name: "CashMySalary",
+      response: {
+        Leadcredit: {
+          dedupe: {
+            success: verifyData.success || true,
+            message: verifyData.message || "Lead accepted for further processing",
+            fullResponse: verifyData,
+            createdAt: new Date().toISOString()
+          },
+          leadCreate: {
+            success: apiResponse.success || false,
+            message: apiResponse.message || "",
+            fullResponse: {
+              success: apiResponse.success,
+              message: apiResponse.message,
+              data: responseData
+            },
+            createdAt: new Date().toISOString()
+          }
+        }
+      },
       phone: mobile,
       pan: pancard,
-      name: lead.name || "",
       status: isSuccess ? "SUCCESS" : "FAILED",
       loanAmount: loanAmount,
-      score: score,
-      api_response: apiResponse,
-      createdAt: new Date().toISOString().slice(0, 10),
+      score: score
     });
 
     await leadCol.updateOne(
@@ -195,12 +222,20 @@ async function processLead(lead, headers) {
     }
 
     await responseCol.insertOne({
+      name: "CashMySalary",
+      response: {
+        Leadcredit: {
+          leadCreate: {
+            success: false,
+            message: "API Error",
+            fullResponse: errResponse,
+            createdAt: new Date().toISOString()
+          }
+        }
+      },
       phone: mobile,
       pan: pancard,
-      name: lead.name || "",
-      status: "FAILED",
-      api_response: errResponse,
-      createdAt: new Date().toISOString().slice(0, 10),
+      status: "FAILED"
     });
 
     return false;
