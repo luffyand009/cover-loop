@@ -1,6 +1,8 @@
-require('dotenv').config();
 const { MongoClient } = require("mongodb");
 const axios = require("axios");
+const path = require("path");
+const XLSX = require("xlsx");
+require("dotenv").config();
 
 // ------------ CONFIGURATION ------------ //
 const MONGO_URI = process.env.MONGO_URI_COVER;
@@ -18,19 +20,57 @@ const LEAD_VERIFY_URL = `${API_BASE_URL}/api/v1/vendor/lead-verify`;
 const LEAD_PUSH_URL = `${API_BASE_URL}/api/v1/vendor/lead-push`;
 const LENDER_NAME = "cashmysalary";
 
-const MAX_LEADS = 500;
+// ------------ LOAD PINCODES FROM EXCEL ------------ //
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "salaryoncash.xlsx");
+
+function loadValidPincodes() {
+  try {
+    const workbook = XLSX.readFile(PINCODE_FILE_PATH);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    
+    const data = XLSX.utils.sheet_to_json(worksheet);
+    const pincodes = new Set();
+    
+    data.forEach((row) => {
+      const pinKey = Object.keys(row).find(
+        (key) => key.trim().toLowerCase() === 'pincode' || key.trim().toLowerCase() === 'pin'
+      );
+
+      if (pinKey && row[pinKey]) {
+        const cleanPin = String(row[pinKey]).trim();
+        if (cleanPin) {
+          pincodes.add(cleanPin);
+        }
+      }
+    });
+
+    console.log(`✅ Loaded ${pincodes.size} valid pincodes from Excel.`);
+    return pincodes;
+  } catch (error) {
+    console.error(`❌ Error loading pincode file: ${error.message}`);
+    return new Set();
+  }
+}
+
+const allowedPincodes = loadValidPincodes();
+
+// ------------ CONTROL ------------ //
+
+const MAX_LEADS = 500000;
 const BATCH_SIZE = 50;
-const REQUEST_TIMEOUT = 30000;
-const BATCH_DELAY = 1000;
+const MAX_WORKERS = 3;
+const REQUEST_TIMEOUT = 30000; // ms
+const BATCH_DELAY = 1000; // ms
+
+// ---------------- LOGGING ---------------- //
 
 function log(level, message) {
   const timestamp = new Date().toISOString();
-  if (message.includes(CLIENT_SECRET) || message.toLowerCase().includes("accesstoken") || message.toLowerCase().includes("refreshtoken")) {
-    console.log(`${timestamp} - ${level} - [REDACTED SENSITIVE DATA]`);
-    return;
-  }
   console.log(`${timestamp} - ${level} - ${message}`);
 }
+
+// ---------------- MONGO ---------------- //
 
 let client;
 let leadCol;
@@ -48,6 +88,8 @@ async function connectMongo() {
   log("INFO", "✅ MongoDB Connected Successfully");
 }
 
+// ---------------- HELPERS ---------------- //
+
 function formatDob(dob) {
   if (!dob) return "1998-05-15";
   if (dob instanceof Date && !isNaN(dob)) {
@@ -62,12 +104,61 @@ function formatDob(dob) {
   return "1998-05-15";
 }
 
+function calculateAge(dob) {
+  const formattedDobStr = formatDob(dob);
+  const parts = formattedDobStr.split("-");
+  if (parts.length !== 3) return null;
+
+  const year = parseInt(parts[0], 10);
+  const month = parseInt(parts[1], 10) - 1;
+  const day = parseInt(parts[2], 10);
+
+  const birthDate = new Date(year, month, day);
+  if (isNaN(birthDate.getTime())) return null;
+
+  const today = new Date();
+  let age = today.getFullYear() - birthDate.getFullYear();
+  const m = today.getMonth() - birthDate.getMonth();
+  
+  if (m < 0 || (m === 0 && today.getDate() < birthDate.getDate())) {
+    age--;
+  }
+
+  return age;
+}
+
+function isValidPincode(pincode) {
+  if (!pincode) return false;
+  const pinStr = String(pincode).trim();
+  return /^[1-9][0-9]{5}$/.test(pinStr);
+}
+
 function shouldSkip(lead) {
-  const required = ["phone", "pan"];
+  const required = ["phone", "pan", "dob", "income", "employment", "pincode"];
   for (const field of required) {
     if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
 
+  // 1. Age Check (21 to 55 years)
+  const age = calculateAge(lead.dob);
+  if (age === null || age < 21 || age > 55) return "OUT_OF_AGE_RANGE";
+
+  // 2. Employment Validation (Salaried only)
+  const emp = (lead.employment || "").trim().toLowerCase();
+  if (emp !== "salaried") return "INVALID_EMPLOYMENT";
+
+  // 3. Income Validation (Must be >= 25000)
+  const incomeVal = parseFloat(String(lead.income || "0").replace(/,/g, "").trim());
+  if (isNaN(incomeVal) || incomeVal < 25000) return "LOW_INCOME";
+
+  // 4. Excel Pincode Validation
+  const leadPincode = String(lead.pincode || "").trim();
+  if (!isValidPincode(leadPincode)) return "INVALID_PINCODE";
+  if (allowedPincodes.size > 0 && !allowedPincodes.has(leadPincode)) {
+    return "EXCLUDED_PINCODE";
+  }
+
+  // 5. Already Processed Check
   if (lead.processed && Array.isArray(lead.processed)) {
     const hasAlreadyProcessed = lead.processed.some(
       (lender) => String(lender).toLowerCase().startsWith(LENDER_NAME.toLowerCase())
@@ -77,6 +168,8 @@ function shouldSkip(lead) {
 
   return false;
 }
+
+// ---------------- WORKER ---------------- //
 
 async function processLead(lead, headers) {
   const mobile = String(lead.phone || "").trim();
@@ -150,8 +243,8 @@ async function processLead(lead, headers) {
       firstName: firstName,
       lastName: lastName,
       dob: formatDob(lead.dob),
-      empSalary: String(lead.income || "50000"),
-      pinCode: String(lead.pincode || "201301"),
+      empSalary: String(lead.income || "25000"),
+      pinCode: String(lead.pincode).trim(),
     };
 
     const pushRes = await axios.post(LEAD_PUSH_URL, pushPayload, {
@@ -174,7 +267,6 @@ async function processLead(lead, headers) {
 
     const isSuccess = decision === "Approve" || decision === "Review" || apiResponse.success === true;
 
-    // 🎯 Nested Structure Matching Compass Screenshot Format
     await responseCol.insertOne({
       name: "CashMySalary",
       response: {
@@ -242,6 +334,8 @@ async function processLead(lead, headers) {
   }
 }
 
+// ---------------- CONCURRENCY HELPER ---------------- //
+
 async function runWithConcurrencyLimit(items, limit, fn, headers) {
   let successCount = 0;
   let nextIndex = 0;
@@ -269,12 +363,14 @@ async function runWithConcurrencyLimit(items, limit, fn, headers) {
 }
 
 async function processBatch(batch, headers) {
-  return runWithConcurrencyLimit(batch, 3, processLead, headers);
+  return runWithConcurrencyLimit(batch, MAX_WORKERS, processLead, headers);
 }
 
 function sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
+
+// ---------------- MAIN PROCESS ---------------- //
 
 async function processLeads() {
   log("INFO", "🔍 Fetching unprocessed leads from MongoDB...");
@@ -290,7 +386,10 @@ async function processLeads() {
 
   let total = 0;
   let processed = 0;
+  let skipped = 0;
+  
   let batch = [];
+  let skippedBulkOps = [];
 
   const headers = {
     "Content-Type": "application/json",
@@ -301,6 +400,34 @@ async function processLeads() {
 
   for await (const lead of cursor) {
     total++;
+
+    if (total % 1000 === 0) {
+      log("INFO", `Scanned ${total} records... (Queue for API: ${batch.length}, Total Skipped: ${skipped})`);
+    }
+
+    const skipReason = shouldSkip(lead);
+
+    if (skipReason) {
+      if (skipReason === "ALREADY_PROCESSED") continue;
+
+      skipped++;
+      const skipTag = `${LENDER_NAME}: skipped_${skipReason}`;
+
+      skippedBulkOps.push({
+        updateOne: {
+          filter: { _id: lead._id },
+          update: { $addToSet: { processed: skipTag } }
+        }
+      });
+
+      if (skippedBulkOps.length >= BATCH_SIZE) {
+        await leadCol.bulkWrite(skippedBulkOps);
+        skippedBulkOps = [];
+      }
+
+      continue;
+    }
+
     batch.push(lead);
 
     if (batch.length === BATCH_SIZE) {
@@ -316,13 +443,26 @@ async function processLeads() {
     processed += await processBatch(batch, headers);
   }
 
+  if (skippedBulkOps.length > 0) {
+    await leadCol.bulkWrite(skippedBulkOps);
+    skippedBulkOps = [];
+  }
+
   log("INFO", "----- SUMMARY -----");
   log("INFO", `TOTAL UNPROCESSED FETCHED : ${total}`);
   log("INFO", `PROCESSED (SUCCESS/API)   : ${processed}`);
+  log("INFO", `TOTAL SKIPPED (UPDATED DB): ${skipped}`);
 }
+
+// ---------------- RUN ---------------- //
 
 async function main() {
   try {
+    if (allowedPincodes.size === 0) {
+      log("ERROR", "❌ No pincodes loaded from Excel file. Aborting execution.");
+      return;
+    }
+
     await connectMongo();
     await processLeads();
   } catch (err) {
