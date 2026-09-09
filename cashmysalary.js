@@ -6,7 +6,7 @@ const axios = require("axios");
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "keshvadb";
+const LEAD_COLLECTION = "keshvacredit";
 const RESPONSE_COLLECTION = "cashmysalary";
 
 const API_BASE_URL = "https://loanapply-api.cashmysalary.com";
