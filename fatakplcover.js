@@ -19,7 +19,7 @@ const FATAKPAY_ELIGIBILITY_URL = `${FATAKPAY_BASE_URL}/external-api/v1/emi-insur
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "py";
+const LEAD_COLLECTION = "payme";
 const RESPONSE_COLLECTION = "fatakpl";
 
 const FATAKPAY_USERNAME = "CoverMantra";
@@ -28,7 +28,7 @@ const LENDER_NAME = "fatakpayPl";
 
 // Processing Configuration (5 Lakh limit removed & speed optimized)
 const SKIP = 0;
-const BATCH_SIZE = 1000;      // 👈 Batch size increased for faster processing
+const BATCH_SIZE = 500;      // 👈 Batch size increased for faster processing
 const MAX_THREADS = 25;       // 👈 Increased threads for high-speed concurrent hits
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;

@@ -1,5 +1,7 @@
 const { MongoClient } = require("mongodb");
 const axios = require("axios");
+const path = require("path");
+const XLSX = require("xlsx");
 require("dotenv").config();
 
 // ------------ CONFIGURATION ------------ //
@@ -18,12 +20,47 @@ const LEAD_VERIFY_URL = `${API_BASE_URL}/api/v1/vendor/lead-verify`;
 const LEAD_PUSH_URL = `${API_BASE_URL}/api/v1/vendor/lead-push`;
 const LENDER_NAME = "jetfund";
 
-// ------------ CONTROL ------------ //
+// ------------ LOAD PINCODES FROM EXCEL ------------ //
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "jetfund.xlsx");
+
+function loadValidPincodes() {
+  try {
+    const workbook = XLSX.readFile(PINCODE_FILE_PATH);
+    const sheetName = workbook.SheetNames[0];
+    const worksheet = workbook.Sheets[sheetName];
+    
+    const data = XLSX.utils.sheet_to_json(worksheet);
+    const pincodes = new Set();
+    
+    data.forEach((row) => {
+      const pinKey = Object.keys(row).find(
+        (key) => key.trim().toLowerCase() === 'pincode' || key.trim().toLowerCase() === 'pin'
+      );
+
+      if (pinKey && row[pinKey]) {
+        const cleanPin = String(row[pinKey]).trim();
+        if (cleanPin) {
+          pincodes.add(cleanPin);
+        }
+      }
+    });
+
+    console.log(`✅ Loaded ${pincodes.size} valid pincodes from Excel.`);
+    return pincodes;
+  } catch (error) {
+    console.error(`❌ Error loading pincode file: ${error.message}`);
+    return new Set();
+  }
+}
+
+const allowedPincodes = loadValidPincodes();
+
+// ------------ CONTROL (High-Speed Configuration) ------------ //
 const MAX_LEADS = 500000;
-const BATCH_SIZE = 50;
-const MAX_WORKERS = 3;
+const BATCH_SIZE = 500;
+const MAX_WORKERS = 15;
 const REQUEST_TIMEOUT = 30000; // ms
-const BATCH_DELAY = 1000; // ms
+const BATCH_DELAY = 500;      // ms
 
 // ---------------- LOGGING ---------------- //
 function log(level, message) {
@@ -96,34 +133,32 @@ function isValidPincode(pincode) {
   return /^[1-9][0-9]{5}$/.test(pinStr);
 }
 
-// Exclude J&K (18, 19) and Seven Sisters / North-East states (78, 79)
-function isExcludedPincode(pincode) {
-  const pinStr = String(pincode).trim();
-  return /^(18|19|78|79)/.test(pinStr);
-}
-
 function shouldSkip(lead) {
   const required = ["phone", "pan", "dob", "income", "employment", "pincode"];
   for (const field of required) {
     if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
 
-  // 1. Age Check (Updated to 22 to 50 years)
+  // 1. Age Check (21 to 58 years as per Jet Fund policy)[cite: 2]
   const age = calculateAge(lead.dob);
-  if (age === null || age < 22 || age > 50) return "OUT_OF_AGE_RANGE";
+  if (age === null || age < 21 || age > 58) return "OUT_OF_AGE_RANGE";
 
-  // 2. Employment Validation (Salaried only)
+  // 2. Employment Validation (Salaried and Self-Employed allowed)
   const emp = (lead.employment || "").trim().toLowerCase();
-  if (emp !== "salaried") return "INVALID_EMPLOYMENT";
+  if (emp !== "salaried" && emp !== "self-employed" && emp !== "self employed") {
+    return "INVALID_EMPLOYMENT";
+  }
 
-  // 3. Income Validation (Updated to >= 22000)
+  // 3. Income Validation (>= 15000 as per policy)[cite: 2]
   const incomeVal = parseFloat(String(lead.income || "0").replace(/,/g, "").trim());
-  if (isNaN(incomeVal) || incomeVal < 22000) return "LOW_INCOME";
+  if (isNaN(incomeVal) || incomeVal < 15000) return "LOW_INCOME";
 
-  // 4. Pincode Validation & Regional Exclusion (All India except J&K & Seven Sisters)
+  // 4. Excel Pincode Validation
   const leadPincode = String(lead.pincode || "").trim();
   if (!isValidPincode(leadPincode)) return "INVALID_PINCODE";
-  if (isExcludedPincode(leadPincode)) return "EXCLUDED_PINCODE";
+  if (allowedPincodes.size > 0 && !allowedPincodes.has(leadPincode)) {
+    return "EXCLUDED_PINCODE";
+  }
 
   // 5. Already Processed Check
   if (lead.processed && Array.isArray(lead.processed)) {
@@ -200,10 +235,10 @@ async function processLead(lead, headers) {
       return false;
     }
 
-    // 2. Lead Push API
-    const nameParts = (lead.name || "Customer NA").trim().split(/\s+/);
+    // 2. Lead Push API (Safe Name Parsing for Single/Multi words)
+    const nameParts = (lead.name || "Customer").trim().split(/\s+/);
     const firstName = nameParts[0];
-    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : "NA";
+    const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : firstName;
 
     const pushPayload = {
       mobile: mobile,
@@ -211,7 +246,7 @@ async function processLead(lead, headers) {
       firstName: firstName,
       lastName: lastName,
       dob: formatDob(lead.dob),
-      empSalary: String(lead.income || "22000"),
+      empSalary: String(lead.income || "15000"),
       pinCode: String(lead.pincode).trim(),
     };
 
@@ -228,8 +263,12 @@ async function processLead(lead, headers) {
 
     const apiResponse = pushRes.data || {};
     const responseData = apiResponse.data || {};
-    const decision = responseData.Decision || "Reject";
     
+    if (!apiResponse.success) {
+      log("WARN", `Lead Push failed for ${mobile}: ${JSON.stringify(apiResponse)}`);
+    }
+
+    const decision = responseData.Decision || "Reject";
     const loanAmount = typeof responseData.LoanAmount === 'number' ? responseData.LoanAmount : Number(responseData.LoanAmount) || 0;
     const score = typeof responseData.score === 'number' ? responseData.score : Number(responseData.score) || 0;
 
@@ -270,8 +309,8 @@ async function processLead(lead, headers) {
       { $addToSet: { processed: LENDER_NAME } }
     );
 
-    log("INFO", `Successfully pushed lead ${mobile} | Decision: ${decision} | LoanAmount: ${loanAmount} | Score: ${score}`);
-    return true;
+    log("INFO", `Processed lead ${mobile} | Status: ${isSuccess ? 'SUCCESS' : 'FAILED'} | Decision: ${decision} | LoanAmount: ${loanAmount}`);
+    return isSuccess;
 
   } catch (axiosError) {
     let errResponse = { error: axiosError.message };
@@ -424,6 +463,11 @@ async function processLeads() {
 // ---------------- RUN ---------------- //
 async function main() {
   try {
+    if (allowedPincodes.size === 0) {
+      log("ERROR", "❌ No pincodes loaded from Excel file. Aborting execution.");
+      return;
+    }
+
     await connectMongo();
     await processLeads();
   } catch (err) {
