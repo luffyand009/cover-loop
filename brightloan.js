@@ -11,12 +11,15 @@ const RESPONSE_COLLECTION = "brightloans_responses";
 
 const API_BASE_URL = "https://partner-api-uat.brightloans.in/api/v1";
 const ELIGIBILITY_URL = `${API_BASE_URL}/leads/check-eligibility`;
+
+// Sahi credentials yahan set hain
 const API_KEY = "98669d80e0e34ead997250c308311b0ca483269d";
+const USERNAME = "COVERMANTRA_LEADS_BLS";
 const LENDER_NAME = "brightloans";
 
 // ------------ CONTROL CONFIG (High-Speed) ------------ //
-const MAX_LEADS = 500000;
-const BATCH_SIZE = 500;
+const MAX_LEADS = 500;
+const BATCH_SIZE = 50;
 const MAX_WORKERS = 15;
 const REQUEST_TIMEOUT = 30000;
 const BATCH_DELAY = 500;
@@ -88,7 +91,7 @@ function shouldSkip(lead) {
     if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
 
-  // 1. Age Check (24 to 56 years as per BrightLoans policy)
+  // 1. Age Check (24 to 56 years)
   const age = calculateAge(lead.dob);
   if (age === null || age < 24 || age > 56) return "OUT_OF_AGE_RANGE";
 
@@ -124,7 +127,7 @@ function shouldSkip(lead) {
 }
 
 // ---------------- WORKER ---------------- //
-async function processLead(lead, headers) {
+async function processLead(lead) {
   const mobile = String(lead.phone || "").trim();
   const pancard = String(lead.pan || "").trim();
 
@@ -141,7 +144,7 @@ async function processLead(lead, headers) {
 
   log("INFO", `Processing lead for BrightLoans: ${mobile} / ${pancard}`);
 
-  // Name parsing (First name and Last name required, alphabets only)
+  // Name parsing
   const nameParts = (lead.name || "Customer").trim().replace(/[^a-zA-Z ]/g, "").split(/\s+/);
   const firstName = nameParts[0] || "Customer";
   const lastName = nameParts.length > 1 ? nameParts.slice(1).join("") : firstName;
@@ -158,6 +161,13 @@ async function processLead(lead, headers) {
     dob: formatDob(lead.dob),
     personal_email: lead.email || "customer@example.com",
     pincode: String(lead.pincode).trim()
+  };
+
+  // Correct Headers with separate Username and API Key
+  const headers = {
+    "Content-Type": "application/json",
+    "api-key": API_KEY,
+    "username": USERNAME
   };
 
   try {
@@ -194,7 +204,7 @@ async function processLead(lead, headers) {
 }
 
 // ---------------- CONCURRENCY HELPER ---------------- //
-async function runWithConcurrencyLimit(items, limit, fn, headers) {
+async function runWithConcurrencyLimit(items, limit, fn) {
   let successCount = 0;
   let nextIndex = 0;
 
@@ -205,7 +215,7 @@ async function runWithConcurrencyLimit(items, limit, fn, headers) {
 
       const currentItem = items[currentIndex];
       try {
-        const success = await fn(currentItem, headers);
+        const success = await fn(currentItem);
         if (success) successCount++;
       } catch (e) {
         log("ERROR", `Worker failed: ${e.message}`);
@@ -238,12 +248,6 @@ async function processLeads() {
   let batch = [];
   let skippedBulkOps = [];
 
-  const headers = {
-    "Content-Type": "application/json",
-    "api-key": API_KEY,
-    "username": API_KEY
-  };
-
   for await (const lead of cursor) {
     total++;
     const skipReason = shouldSkip(lead);
@@ -267,14 +271,14 @@ async function processLeads() {
 
     batch.push(lead);
     if (batch.length === BATCH_SIZE) {
-      processed += await runWithConcurrencyLimit(batch, MAX_WORKERS, processLead, headers);
+      processed += await runWithConcurrencyLimit(batch, MAX_WORKERS, processLead);
       batch = [];
       await new Promise(r => setTimeout(r, BATCH_DELAY));
     }
   }
 
   if (batch.length) {
-    processed += await runWithConcurrencyLimit(batch, MAX_WORKERS, processLead, headers);
+    processed += await runWithConcurrencyLimit(batch, MAX_WORKERS, processLead);
   }
 
   if (skippedBulkOps.length > 0) {
