@@ -3,9 +3,9 @@ const axios = require("axios");
 require("dotenv").config();
 
 const MONGO_URI = process.env.MONGO_URI_COVER;
-const DB_NAME = "coverloop";
+const DB_NAME = "CoverMantra";
 
-const LEAD_COLLECTION = "keshvadb";
+const LEAD_COLLECTION = "payme"
 const RESPONSE_COLLECTION = "cover_vivi";
 
 const ACCESS_TOKEN_URL = "https://api.flexsalary.com/apiv1/api/AccessToken/Post";
