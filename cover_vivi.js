@@ -19,7 +19,7 @@ const LENDER_NAME = "flexsalary";
 // ------------ CONTROL ------------ //
 
 const MAX_LEADS = 5000000;
-const BATCH_SIZE = 500;
+const BATCH_SIZE = 300;
 const MAX_WORKERS = 7;
 const REQUEST_TIMEOUT = 30000; // ms
 const BATCH_DELAY = 1000; // ms

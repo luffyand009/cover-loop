@@ -2,6 +2,8 @@ const { MongoClient } = require("mongodb");
 const axios = require("axios");
 const path = require("path");
 const XLSX = require("xlsx");
+const http = require("http");
+const https = require("https");
 require("dotenv").config();
 
 // ------------ CONFIGURATION ------------ //
@@ -11,14 +13,19 @@ const DB_NAME = "coverloop";
 const LEAD_COLLECTION = "py";
 const RESPONSE_COLLECTION = "jetfund";
 
-const API_BASE_URL = "https://dev-api-apply.jetfund.in";
-const TENANT_DOMAIN = "dev-apply.jetfund.in";
-const CLIENT_ID = "client_65dedb0b2003";
-const CLIENT_SECRET = "60cd38c1840610c3f3b125f6df41bb67613ee78da7e612a8f0d68d730f1174a7";
+const API_BASE_URL = "https://loanapply-api.jetfund.in/api/v1";
+const TENANT_DOMAIN = "loanapply.jetfund.in";
+const CLIENT_ID = "client_387827bcc880";
+const CLIENT_SECRET = "d017a880d7e37692d772f0557c89c9b40577e0a964bbea6085960cf5b8296808";
 
-const LEAD_VERIFY_URL = `${API_BASE_URL}/api/v1/vendor/lead-verify`;
-const LEAD_PUSH_URL = `${API_BASE_URL}/api/v1/vendor/lead-push`;
+const LEAD_VERIFY_URL = `${API_BASE_URL}/vendor/lead-verify`;
+const LEAD_PUSH_URL = `${API_BASE_URL}/vendor/lead-push`;
 const LENDER_NAME = "jetfund";
+
+// ------------ AXIOS AGENTS (Prevent Hanging & IPv6 Issues) ------------ //
+const agentOptions = { family: 4 };
+const httpAgent = new http.Agent(agentOptions);
+const httpsAgent = new https.Agent(agentOptions);
 
 // ------------ LOAD PINCODES FROM EXCEL ------------ //
 const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "jetfund.xlsx");
@@ -56,11 +63,11 @@ function loadValidPincodes() {
 const allowedPincodes = loadValidPincodes();
 
 // ------------ CONTROL (High-Speed Configuration) ------------ //
-const MAX_LEADS = 500000;
-const BATCH_SIZE = 500;
-const MAX_WORKERS = 15;
+const MAX_LEADS = 600;
+const BATCH_SIZE = 50;
+const MAX_WORKERS = 5;
 const REQUEST_TIMEOUT = 30000; // ms
-const BATCH_DELAY = 500;      // ms
+const BATCH_DELAY = 10000;       // ms
 
 // ---------------- LOGGING ---------------- //
 function log(level, message) {
@@ -139,7 +146,7 @@ function shouldSkip(lead) {
     if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
 
-  // 1. Age Check (21 to 58 years as per Jet Fund policy)[cite: 2]
+  // 1. Age Check (21 to 58 years as per Jet Fund policy)
   const age = calculateAge(lead.dob);
   if (age === null || age < 21 || age > 58) return "OUT_OF_AGE_RANGE";
 
@@ -149,7 +156,7 @@ function shouldSkip(lead) {
     return "INVALID_EMPLOYMENT";
   }
 
-  // 3. Income Validation (>= 15000 as per policy)[cite: 2]
+  // 3. Income Validation (>= 15000 as per policy)
   const incomeVal = parseFloat(String(lead.income || "0").replace(/,/g, "").trim());
   if (isNaN(incomeVal) || incomeVal < 15000) return "LOW_INCOME";
 
@@ -192,9 +199,13 @@ async function processLead(lead, headers) {
   try {
     // 1. Lead Verify - Dedupe API
     const verifyPayload = { mobile, pancard };
+    log("INFO", `Sending Verify request for ${mobile} to ${LEAD_VERIFY_URL}`);
+    
     const verifyRes = await axios.post(LEAD_VERIFY_URL, verifyPayload, {
       headers,
       timeout: REQUEST_TIMEOUT,
+      httpAgent,
+      httpsAgent,
       validateStatus: () => true
     });
 
@@ -206,7 +217,8 @@ async function processLead(lead, headers) {
     const verifyData = verifyRes.data || {};
     log("INFO", `Lead Verify Response for ${mobile}: ${JSON.stringify(verifyData)}`);
 
-    const customerExists = verifyData.success === false || verifyData.exists === true || (verifyData.message && verifyData.message.toLowerCase().includes("exist"));
+    // Check if customer already exists (success: false or message contains exists)
+    const customerExists = verifyData.success === false || (verifyData.message && verifyData.message.toLowerCase().includes("exist"));
 
     if (customerExists) {
       log("WARN", `Customer already exists for ${mobile}. Skipping Lead Push.`);
@@ -216,7 +228,7 @@ async function processLead(lead, headers) {
         response: {
           Leadcredit: {
             dedupe: {
-              success: verifyData.success || false,
+              success: false,
               message: verifyData.message || "Customer already exists",
               fullResponse: verifyData,
               createdAt: new Date().toISOString()
@@ -235,7 +247,7 @@ async function processLead(lead, headers) {
       return false;
     }
 
-    // 2. Lead Push API (Safe Name Parsing for Single/Multi words)
+    // 2. Lead Push API (Executed ONLY if customer does not exist)
     const nameParts = (lead.name || "Customer").trim().split(/\s+/);
     const firstName = nameParts[0];
     const lastName = nameParts.length > 1 ? nameParts.slice(1).join(" ") : firstName;
@@ -250,9 +262,13 @@ async function processLead(lead, headers) {
       pinCode: String(lead.pincode).trim(),
     };
 
+    log("INFO", `Sending Push request for ${mobile} to ${LEAD_PUSH_URL}`);
+
     const pushRes = await axios.post(LEAD_PUSH_URL, pushPayload, {
       headers,
       timeout: REQUEST_TIMEOUT,
+      httpAgent,
+      httpsAgent,
       validateStatus: () => true
     });
 
@@ -263,24 +279,21 @@ async function processLead(lead, headers) {
 
     const apiResponse = pushRes.data || {};
     const responseData = apiResponse.data || {};
+    const redirectUrl = responseData.redirect_url;
     
-    if (!apiResponse.success) {
-      log("WARN", `Lead Push failed for ${mobile}: ${JSON.stringify(apiResponse)}`);
+    if (!apiResponse.success || !redirectUrl) {
+      log("WARN", `Lead Push failed or no redirect URL for ${mobile}: ${JSON.stringify(apiResponse)}`);
     }
 
-    const decision = responseData.Decision || "Reject";
-    const loanAmount = typeof responseData.LoanAmount === 'number' ? responseData.LoanAmount : Number(responseData.LoanAmount) || 0;
-    const score = typeof responseData.score === 'number' ? responseData.score : Number(responseData.score) || 0;
+    const isSuccess = apiResponse.success === true && !!redirectUrl;
 
-    const isSuccess = decision === "Approve" || decision === "Review" || apiResponse.success === true;
-
-    // Nested Structure Saving
+    // Nested Structure Saving (Without score/decision, with redirect_url)
     await responseCol.insertOne({
       name: "Jetfund",
       response: {
         Leadcredit: {
           dedupe: {
-            success: verifyData.success || true,
+            success: true,
             message: verifyData.message || "Lead accepted for further processing",
             fullResponse: verifyData,
             createdAt: new Date().toISOString()
@@ -288,28 +301,37 @@ async function processLead(lead, headers) {
           leadCreate: {
             success: apiResponse.success || false,
             message: apiResponse.message || "",
-            fullResponse: {
-              success: apiResponse.success,
-              message: apiResponse.message,
-              data: responseData
-            },
+            redirect_url: redirectUrl || null,
+            fullResponse: apiResponse,
             createdAt: new Date().toISOString()
           }
         }
       },
       phone: mobile,
       pan: pancard,
-      status: isSuccess ? "SUCCESS" : "FAILED",
-      loanAmount: loanAmount,
-      score: score
+      status: isSuccess ? "SUCCESS" : "FAILED"
     });
 
-    await leadCol.updateOne(
-      { _id: lead._id },
-      { $addToSet: { processed: LENDER_NAME } }
-    );
+    if (isSuccess) {
+      await leadCol.updateOne(
+        { _id: lead._id },
+        { 
+          $set: { 
+            jetfund_redirect_url: redirectUrl,
+            jetfund_status: "PENDING_JOURNEY"
+          },
+          $addToSet: { processed: LENDER_NAME } 
+        }
+      );
+      log("INFO", `Processed lead ${mobile} | Status: SUCCESS | Redirect URL Generated`);
+    } else {
+      await leadCol.updateOne(
+        { _id: lead._id },
+        { $addToSet: { processed: `${LENDER_NAME}_FAILED` } }
+      );
+      log("WARN", `Processed lead ${mobile} | Status: FAILED`);
+    }
 
-    log("INFO", `Processed lead ${mobile} | Status: ${isSuccess ? 'SUCCESS' : 'FAILED'} | Decision: ${decision} | LoanAmount: ${loanAmount}`);
     return isSuccess;
 
   } catch (axiosError) {
