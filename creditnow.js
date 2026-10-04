@@ -4,7 +4,6 @@ const path = require("path");
 const XLSX = require("xlsx");
 require("dotenv").config();
 
-// Hardcoded MongoDB URI
 const MONGO_URI = process.env.MONGO_URI_COVER;
 
 const DB_NAME = "coverloop";
@@ -13,7 +12,6 @@ const RESPONSE_COLLECTION = "creditt_responses";
 const LEAD_API_URL = "https://agency.ctpl.live/lead/ingest/cover_mantra";
 const LENDER_NAME = "creditplus";
 
-// ------------ LOAD PINCODES FROM EXCEL ------------ //
 const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "creditnow.xlsx");
 
 function loadValidPincodes() {
@@ -49,22 +47,20 @@ function loadValidPincodes() {
 const allowedPincodes = loadValidPincodes();
 
 const BATCH_SIZE = 100;
-const MAX_WORKERS = 7;
 const REQUEST_TIMEOUT = 30000;
 const BATCH_DELAY = 2000;
 
 function log(level, message) {
-  console.log(`${new Date().toISOString()} - ${level} - ${message}`);
+  console.log(`${new Date().toISOString()} [${level}] ${message}`);
 }
 
-// Validation function including Excel Pincode check
+// Yeh function API hit hone se pehle check karega
 function shouldSkip(lead) {
   const required = ["phone", "pincode"];
   for (const field of required) {
     if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
 
-  // Excel Pincode Validation
   const leadPincode = String(lead.pincode || "").trim();
   if (allowedPincodes.size > 0 && !allowedPincodes.has(leadPincode)) {
     return "EXCLUDED_PINCODE";
@@ -74,10 +70,18 @@ function shouldSkip(lead) {
 }
 
 async function processLead(item, leadCol, responseCol) {
+  // 🛑 API hit hone se pehle validation check
   const skipReason = shouldSkip(item);
   if (skipReason) {
-    log("WARN", `Skipped lead ${item.phone} due to: ${skipReason}`);
-    await leadCol.updateOne({ _id: item._id }, { $addToSet: { processed: `${LENDER_NAME}: skipped_${skipReason}` } });
+    log("WARN", `Skipped lead ${item.phone || 'UNKNOWN'} due to: ${skipReason}`);
+    
+    // Agar _id available hai toh database me tag laga do taaki dobara fetch na ho
+    if (item._id) {
+      await leadCol.updateOne(
+        { _id: item._id }, 
+        { $addToSet: { processed: `${LENDER_NAME}: skipped_${skipReason}` } }
+      );
+    }
     return false;
   }
 
@@ -107,20 +111,23 @@ async function processLead(item, leadCol, responseCol) {
     };
 
     const isSuccess = formattedApiResponse.message === "SUCCESS" || formattedApiResponse.message === "DUPLICATE";
+    const responseStatusTag = formattedApiResponse.message;
 
-    // ✅ Added name and pan here
     await responseCol.insertOne({
       phone: item.phone,
       name: item.name || "",
       pan: item.pan || "",
-      status: isSuccess ? formattedApiResponse.message : "FAILED",
+      status: isSuccess ? responseStatusTag : "FAILED",
       api_response: formattedApiResponse,
       createdAt: new Date().toISOString().slice(0, 10)
     });
 
-    await leadCol.updateOne({ _id: item._id }, { $addToSet: { processed: LENDER_NAME } });
+    await leadCol.updateOne(
+      { _id: item._id }, 
+      { $addToSet: { processed: `${LENDER_NAME}: ${responseStatusTag}` } }
+    );
     
-    if (formattedApiResponse.message === "DUPLICATE") {
+    if (responseStatusTag === "DUPLICATE") {
       log("WARN", `Duplicate lead recorded: ${item.phone}`);
     } else {
       log("INFO", `Successfully processed lead: ${item.phone}`);
@@ -136,8 +143,9 @@ async function processLead(item, leadCol, responseCol) {
           data: errData.data || {}
         };
 
-        if (formattedApiResponse.message === "DUPLICATE") {
-          // ✅ Added name and pan here too for duplicates from error responses
+        const errorStatusTag = formattedApiResponse.message;
+
+        if (errorStatusTag === "DUPLICATE") {
           await responseCol.insertOne({
             phone: item.phone,
             name: item.name || "",
@@ -146,16 +154,34 @@ async function processLead(item, leadCol, responseCol) {
             api_response: formattedApiResponse,
             createdAt: new Date().toISOString().slice(0, 10)
           });
-          await leadCol.updateOne({ _id: item._id }, { $addToSet: { processed: LENDER_NAME } });
+          
+          await leadCol.updateOne(
+            { _id: item._id }, 
+            { $addToSet: { processed: `${LENDER_NAME}: DUPLICATE` } }
+          );
+          
           log("WARN", `Duplicate lead handled from error response: ${item.phone}`);
           return true;
         }
 
+        await leadCol.updateOne(
+          { _id: item._id }, 
+          { $addToSet: { processed: `${LENDER_NAME}: ERROR_${errorStatusTag}` } }
+        );
+
         log("ERROR", `API Error for lead ${item.phone}: ${JSON.stringify(errData)}`);
       } else {
+        await leadCol.updateOne(
+          { _id: item._id }, 
+          { $addToSet: { processed: `${LENDER_NAME}: ERROR_HTML_OR_STRING` } }
+        );
         log("ERROR", `Failed for lead ${item.phone} with status/HTML: ${errData}`);
       }
     } else {
+      await leadCol.updateOne(
+        { _id: item._id }, 
+        { $addToSet: { processed: `${LENDER_NAME}: ERROR_NETWORK` } }
+      );
       log("ERROR", `Failed for lead ${item.phone}: ${err.message}`);
     }
     return false;
@@ -179,7 +205,7 @@ async function main() {
     const query = {
       $or: [
         { processed: { $exists: false } },
-        { processed: { $not: { $regex: /cover_mantra/i } } }
+        { processed: { $not: { $regex: new RegExp(LENDER_NAME, "i") } } }
       ]
     };
 
@@ -189,8 +215,6 @@ async function main() {
 
     for await (const lead of cursor) {
       total++;
-      if (!lead.phone) continue;
-
       batch.push(lead);
 
       if (batch.length === BATCH_SIZE) {
