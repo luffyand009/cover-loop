@@ -46,7 +46,7 @@ function loadValidPincodes() {
 
 const allowedPincodes = loadValidPincodes();
 
-const BATCH_SIZE = 100;
+const BATCH_SIZE = 500;
 const REQUEST_TIMEOUT = 30000;
 const BATCH_DELAY = 2000;
 
