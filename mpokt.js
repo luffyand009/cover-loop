@@ -1,5 +1,7 @@
 const { MongoClient } = require("mongodb");
 const axios = require("axios");
+const http = require("http");
+const https = require("https");
 const path = require("path");
 const XLSX = require("xlsx");
 require("dotenv").config();
@@ -11,9 +13,16 @@ const LEAD_COLLECTION = "payme";
 const RESPONSE_COLLECTION = "mpokket_responses";
 
 // mPokket API Endpoints & Credentials (Staging Environment)
-const MPOKKET_API_URL = "https://stg-api.mpkt.in/acquisition-affiliate/v1/user"; //[cite: 9, 33]
-const API_KEY = "CEF3B2C79B8745A08FF6A0B7A694D"; //[cite: 33]
+const MPOKKET_API_URL = "https://stg-api.mpkt.in/acquisition-affiliate/v1/user";
+const API_KEY = "CEF3B2C79B8745A08FF6A0B7A694D";
 const LENDER_NAME = "mpokket";
+
+// Force IPv4 for Axios to prevent Access Denied error on whitelisted IP
+const axiosInstance = axios.create({
+  httpAgent: new http.Agent({ family: 4 }),
+  httpsAgent: new https.Agent({ family: 4 }),
+  timeout: 30000
+});
 
 // Pincode file load karne ke liye
 const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "creditnow.xlsx");
@@ -47,7 +56,6 @@ function loadValidPincodes() {
 const allowedPincodes = loadValidPincodes();
 
 const BATCH_SIZE = 100;
-const REQUEST_TIMEOUT = 30000;
 const BATCH_DELAY = 2000;
 
 function log(level, message) {
@@ -60,7 +68,7 @@ function formatDob(dob) {
   const cleanDate = String(dob).split("T")[0];
   const parts = cleanDate.split("-");
   if (parts.length === 3) {
-    return `${parts[2]}-${parts[1]}-${parts[0]}`; // DD-MM-YYYY format[cite: 12]
+    return `${parts[2]}-${parts[1]}-${parts[0]}`;
   }
   return cleanDate;
 }
@@ -96,12 +104,12 @@ async function processLead(item, leadCol, responseCol) {
   // mPokket Payload Structure mapping
   const payload = {
     email_id: item.email || "",
-    mobile_no: String(item.phone).trim(), //[cite: 12]
+    mobile_no: String(item.phone).trim(),
     pancard: item.pan ? String(item.pan).trim() : "",
     full_name: item.name || "",
-    date_of_birth: formatDob(item.dob), //[cite: 12]
-    gender: item.gender ? item.gender.toLowerCase() === 'male' ? 'Male' : 'Female' : 'Male', //[cite: 12]
-    profession: item.employment || "Salaried", //[cite: 12]
+    date_of_birth: formatDob(item.dob),
+    gender: item.gender ? item.gender.toLowerCase() === 'male' ? 'Male' : 'Female' : 'Male',
+    profession: item.employment || "Salaried",
     additional_info: {
       net_monthly_income: String(item.income || "0"),
       current_address: item.address || "",
@@ -112,16 +120,15 @@ async function processLead(item, leadCol, responseCol) {
   };
 
   try {
-    const res = await axios.post(MPOKKET_API_URL, payload, {
+    const res = await axiosInstance.post(MPOKKET_API_URL, payload, {
       headers: {
-        "api-key": API_KEY, //[cite: 9, 33]
-        "Content-Type": "application/json" //[cite: 9]
-      },
-      timeout: REQUEST_TIMEOUT
+        "api-key": API_KEY,
+        "Content-Type": "application/json"
+      }
     });
 
     const apiResponse = res.data || {};
-    const isSuccess = apiResponse.success === true && apiResponse.status_code === "1200"; //[cite: 11]
+    const isSuccess = apiResponse.success === true && apiResponse.status_code === "1200";
     const responseStatusTag = isSuccess ? "SUCCESS" : (apiResponse.message || "FAILED");
 
     await responseCol.insertOne({
@@ -139,7 +146,7 @@ async function processLead(item, leadCol, responseCol) {
     );
 
     if (isSuccess) {
-      log("INFO", `Successfully processed lead: ${item.phone}, Request ID: ${apiResponse.data?.request_id}`); //[cite: 11]
+      log("INFO", `Successfully processed lead: ${item.phone}, Request ID: ${apiResponse.data?.request_id}`);
     } else {
       log("WARN", `Lead accepted with issue/failed for ${item.phone}: ${JSON.stringify(apiResponse)}`);
     }
@@ -148,7 +155,7 @@ async function processLead(item, leadCol, responseCol) {
   } catch (err) {
     if (err.response) {
       const errData = err.response.data || {};
-      const errorMessage = Array.isArray(errData.message) ? errData.message.join(", ") : (errData.message || "ERROR"); //[cite: 11]
+      const errorMessage = Array.isArray(errData.message) ? errData.message.join(", ") : (errData.message || "ERROR");
 
       await responseCol.insertOne({
         phone: item.phone,
