@@ -19,26 +19,26 @@ const FATAKPAY_ELIGIBILITY_URL = `${FATAKPAY_BASE_URL}/external-api/v1/emi-insur
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "payme";
+const LEAD_COLLECTION = "pldcl";
 const RESPONSE_COLLECTION = "fatakpl";
 
 const FATAKPAY_USERNAME = "CoverMantra";
 const FATAKPAY_PASSWORD = "cdcbb765b95f0cf06d0f";
 const LENDER_NAME = "fatakpayPl";
 
-// Processing Configuration (5 Lakh limit removed & speed optimized)
+// Processing Configuration (Safely throttled to avoid 429 errors)
 const SKIP = 0;
-const BATCH_SIZE = 500;      // 👈 Batch size increased for faster processing
-const MAX_THREADS = 25;       // 👈 Increased threads for high-speed concurrent hits
+const BATCH_SIZE = 100;      // 👈 Reduced batch size for smoother throttling
+const MAX_THREADS = 5;       // 👈 Reduced threads to prevent flooding
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
 const REQUEST_TIMEOUT = 15000; // ms
 
-// Rate Limiting Configuration (Optimized for speed)
-const API_CALL_DELAY = 50;    // ms (Reduced delay)
-const BATCH_DELAY = 500;      // ms (Reduced delay)
-const THREAD_DELAY = 20;      // ms (Reduced delay)
-const MAX_REQUESTS_PER_SECOND = 100; // Increased limit for faster throughput
+// Rate Limiting Configuration (Safe limits for FatakPay API)
+const API_CALL_DELAY = 250;   // ms (Added delay between calls)
+const BATCH_DELAY = 2000;     // ms (Added delay between batches)
+const THREAD_DELAY = 100;     // ms (Added delay between thread starts)
+const MAX_REQUESTS_PER_SECOND = 5; // 👈 Lowered to a safe limit to prevent 429
 
 // Validation Configuration
 const MIN_AGE = 18;
@@ -451,7 +451,6 @@ async function processSingleLead(client, lead) {
     if (!isValid) {
       counters.incrementTraversed();
       counters.incrementRejected();
-      // 👈 Validation failed leads will now be recorded as skipped in fatakpl
       return makeProcessResult({ 
         leadId: String(lead._id), 
         phone: String(lead.phone), 
@@ -527,15 +526,21 @@ async function processBatch(client, leadsBatch, batchNumber) {
   if (!client.token) return 0;
   const results = await runBatchConcurrently(client, leadsBatch);
   await saveResults(results);
+  
   const successfulCount = results.filter((r) => r.success).length;
   logger.info(`✅ BATCH ${batchNumber} COMPLETE (Success: ${successfulCount}/${leadsBatch.length})`);
+
+  // 🔍 PRINT INDIVIDUAL LEAD STATUS & RESPONSES TO CONSOLE
+  results.forEach((res, idx) => {
+    logger.info(`   [${idx + 1}] Phone: ${res.phone} | PAN: ${res.pan} | Status: ${res.status} | Response: ${JSON.stringify(res.responses)}`);
+  });
+
   return results.length;
 }
 
 async function saveResults(results) {
   if (!results.length) return;
   try {
-    // 👈 Now saving ALL results (including validation/skipped leads) into fatakpl response collection
     const apiDocuments = results.map((result) => ({
       leadId: result.leadId,
       phone: result.phone,
@@ -549,7 +554,6 @@ async function saveResults(results) {
       await responseCol.insertMany(apiDocuments, { ordered: false });
     }
 
-    // 🎯 Update lead collection with single clean tag
     for (const result of results) {
       let tag = LENDER_NAME;
       if (result.status.startsWith("skipped_")) {
@@ -562,7 +566,7 @@ async function saveResults(results) {
       await leadCol.updateOne(
         { _id: new ObjectId(result.leadId) },
         { 
-          $pull: { processed: { $regex: `^${LENDER_NAME}`, $options: "i" } } 
+          $pull: { processed: {$regex: `^${LENDER_NAME}`, $options: "i" } } 
         }
       );
       await leadCol.updateOne(
@@ -583,7 +587,7 @@ async function main() {
   const startTime = Date.now();
   await connectMongo();
 
-  logger.info("⚡ HIGH-SPEED UNRESTRICTED PROCESSING STARTED");
+  logger.info("⚡ SAFE-SPEED PROCESSING STARTED");
   counters.startTiming();
   const client = new FatakPayAPIClient();
 
@@ -597,7 +601,6 @@ async function main() {
     let totalProcessedOverall = 0;
     let batchNum = 1;
 
-    // 👈 Infinite loop running until all unprocessed leads are finished (No 5 Lakh limit restriction)
     while (true) {
       const leadsBatch = await getLeadsBatch(SKIP, BATCH_SIZE);
       if (leadsBatch.length === 0) {

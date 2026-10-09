@@ -19,7 +19,7 @@ const FATAKPAY_ELIGIBILITY_URL = `${FATAKPAY_BASE_URL}/external-api/v1/emi-insur
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "py";
+const LEAD_COLLECTION = "pldcl";
 const RESPONSE_COLLECTION = "fatakdcl";
 
 const FATAKPAY_USERNAME = "CoverMantra";
