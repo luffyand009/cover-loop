@@ -29,7 +29,7 @@ const LENDER_NAME = "fatakpayDCL";
 // Processing Configuration
 const MAX_LEADS_DAILY = 50000; // 🎯 Strict Daily Limit: 5 Lakhs
 const SKIP = 0;
-const BATCH_SIZE = 500;       
+const BATCH_SIZE = 100;       
 const MAX_THREADS = 5;        // 429 एरर से बचने के लिए थ्रेड्स कम रखे गए हैं
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
