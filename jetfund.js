@@ -63,8 +63,8 @@ function loadValidPincodes() {
 const allowedPincodes = loadValidPincodes();
 
 // ------------ CONTROL (High-Speed Configuration) ------------ //
-const MAX_LEADS = 600;
-const BATCH_SIZE = 50;
+const MAX_LEADS = 25000;
+const BATCH_SIZE = 100;
 const MAX_WORKERS = 5;
 const REQUEST_TIMEOUT = 30000; // ms
 const BATCH_DELAY = 10000;       // ms

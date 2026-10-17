@@ -18,7 +18,7 @@ const X_USER_ID = "CoverMantra$3214";
 const X_API_KEY = "L5AYE43I55WZDOID";
 const REFERRAL_CODE = "COVERMANTRA01";
 
-// Major Cities Priority List (Inhe sabse pehle priority milegi)
+// Major Cities Priority List
 const PRIORITY_CITIES = [
   "mumbai", "delhi", "bangalore", "hyderabad", 
   "pune", "chennai", "kolkata", "gurgaon", "noida", "coimbatore"
@@ -232,7 +232,7 @@ async function main() {
       }
     }
 
-    // Process remaining batch items if any
+    // Process remaining batch items if any (< 100)
     if (batch.length > 0) {
       console.log(`\n🚀 Processing final batch... Remaining: ${batch.length}`);
       for (const item of batch) {
