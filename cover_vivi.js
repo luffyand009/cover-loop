@@ -12,7 +12,7 @@ const ACCESS_TOKEN_URL = "https://api.flexsalary.com/apiv1/api/AccessToken/Post"
 const LEAD_API_URL = "https://api.flexsalary.com/apiv1/api/LeadCustomer/Post";
 
 const USERNAME = "CoverMantra";
-const PASSWORD = "DvI}rMg]HyP[jXa[";
+const PASSWORD = "u?41DDBD5g3y=(";
 const CAMPAIGN_ID = 9192300;
 const LENDER_NAME = "flexsalary";
 

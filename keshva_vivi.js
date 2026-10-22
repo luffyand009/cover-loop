@@ -14,7 +14,7 @@ const ACCESS_TOKEN_URL = "https://api.flexsalary.com/apiv1/api/AccessToken/Post"
 const LEAD_API_URL = "https://api.flexsalary.com/apiv1/api/LeadCustomer/Post";
 
 const USERNAME = "LP_KeshvaCredit";
-const PASSWORD = "Ia0#7264#5";
+const PASSWORD = "^A&1A8d%59Rq)4";
 const CAMPAIGN_ID = 577759020;
 const LENDER_NAME = "vivifin";
 
