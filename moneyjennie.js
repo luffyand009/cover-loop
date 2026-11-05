@@ -1,5 +1,6 @@
 const fs = require("fs");
 const axios = require("axios");
+const path = require("path");
 const XLSX = require("xlsx");
 const axiosRetry = (() => {
   try {
@@ -21,12 +22,14 @@ const DB_NAME = "coverloop";
 
 const LEAD_COLLECTION = "sm";
 const RESPONSE_COLLECTION = "moneyjenie";
-
 const LENDER_NAME = "moneyjenie";
 
-const BATCH_SIZE = 5;
-const MAX_THREADS = 500;
-const MAX_RETRIES = 300;
+// Exact path for xlsx folder inside your project directory
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "moneyjennie.xlsx");
+
+const BATCH_SIZE = 100;
+const MAX_THREADS = 5;
+const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
 const REQUEST_TIMEOUT = 15000;
 
@@ -41,21 +44,47 @@ const MAX_AGE = 55;
 const MIN_INCOME = 50000;
 
 // ==================== LOAD VALID PINCODES FROM EXCEL ==================== //
-let validPincodesSet = new Set();
-try {
-  if (fs.existsSync("pincodes.xlsx")) {
-    const workbook = XLSX.readFile("pincodes.xlsx");
+function loadValidPincodes() {
+  try {
+    let filePath = PINCODE_FILE_PATH;
+    if (!fs.existsSync(filePath)) {
+      console.log(`⚠️ Pincode file not found at ${filePath}, checking root folder fallback...`);
+      filePath = path.join(__dirname, "pincodes.xlsx");
+    }
+
+    if (!fs.existsSync(filePath)) {
+      console.log(`⚠️ Pincode file not found anywhere, relying on standard 6-digit check.`);
+      return new Set();
+    }
+
+    const workbook = XLSX.readFile(filePath);
     const sheetName = workbook.SheetNames[0];
-    const sheetData = XLSX.utils.sheet_to_json(workbook.Sheets[sheetName]);
-    sheetData.forEach(row => {
-      const pin = String(row.pincode || row.PIN || Object.values(row)[0]).trim();
-      if (pin) validPincodesSet.add(pin);
+    const worksheet = workbook.Sheets[sheetName];
+    const data = XLSX.utils.sheet_to_json(worksheet);
+    const pincodes = new Set();
+
+    data.forEach((row) => {
+      const pinKey = Object.keys(row).find(
+        (key) => key.trim().toLowerCase() === 'pincode' || key.trim().toLowerCase() === 'pin'
+      );
+
+      if (pinKey && row[pinKey]) {
+        const cleanPin = String(row[pinKey]).trim();
+        if (cleanPin) {
+          pincodes.add(cleanPin);
+        }
+      }
     });
-    console.log(`📦 Loaded ${validPincodesSet.size} valid pincodes from pincodes.xlsx`);
+
+    console.log(`📦 Loaded ${pincodes.size} valid pincodes from Excel (${filePath}).`);
+    return pincodes;
+  } catch (error) {
+    console.error(`⚠️ Warning: Could not load pincode file (${error.message}), proceeding without Excel filter.`);
+    return new Set();
   }
-} catch (e) {
-  console.log("⚠️ Could not load pincodes.xlsx, relying on standard 6-digit check.");
 }
+
+const validPincodesSet = loadValidPincodes();
 
 // ==================== LOGGING SETUP ==================== //
 
@@ -252,22 +281,26 @@ function validateLead(lead) {
   if (!lead.phone || !isDigitsOnly(lead.phone) || String(lead.phone).length !== 10) return [false, "invalid_phone", 0];
   if (!lead.pan || ![10, 12].includes(String(lead.pan).length)) return [false, "invalid_pan", 0];
   
+  // Pincode validation (6 digits + Excel Whitelist check)
   const pin = String(lead.pincode || "").trim();
   if (!pin || !isDigitsOnly(pin) || pin.length !== 6) return [false, "invalid_pincode", 0];
   if (validPincodesSet.size > 0 && !validPincodesSet.has(pin)) {
     return [false, "pincode_not_whitelisted", 0];
   }
 
+  // Employment check: Must be Salaried
   const empType = String(lead.employment || lead.employeeType || "").toLowerCase();
   if (!empType.includes("salaried")) {
     return [false, "not_salaried", 0];
   }
 
+  // Age Check (23 - 55)
   const age = calculateAge(lead.dob);
   if (age === 0) return [false, "invalid_dob", age];
   if (age < MIN_AGE) return [false, "age_too_young", age];
   if (age > MAX_AGE) return [false, "age_too_old", age];
 
+  // Income Check (Min 50,000)
   let incomeValue;
   try {
     incomeValue = parseFloat(String(lead.income || lead.monthlyIncome || "0").replace(/,/g, "").trim());
@@ -348,7 +381,7 @@ async function processSingleLead(lead) {
     const [respData, respStatus] = await sendMoneyJenieRequest(lead);
     counters.incrementTraversed();
 
-    // Fixed success condition based on actual MoneyJenie response structure (leadID or success message)
+    // Success response condition checking leadID / message
     const isSuccess = respStatus >= 200 && respStatus < 300 && respData && 
       (respData.leadID || respData.success === true || respData.status === true || 
        (respData.message && respData.message.toLowerCase().includes("successfully")));

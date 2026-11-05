@@ -67,13 +67,13 @@ const MAX_LEADS = 25000;
 const BATCH_SIZE = 100;
 const MAX_WORKERS = 5;
 const REQUEST_TIMEOUT = 30000; // ms
-const BATCH_DELAY = 10000;       // ms
+const BATCH_DELAY = 10000;      // ms
 
 // ---------------- LOGGING ---------------- //
 function log(level, message) {
   const timestamp = new Date().toISOString();
   if (message.includes(CLIENT_SECRET) || message.toLowerCase().includes("accesstoken")) {
-    console.log(`${timestamp} - ${level} - [REDACTED SENSITIVE DATA]`);
+    console.log(`${timestamp} - ${level} [REDACTED SENSITIVE DATA]`);
     return;
   }
   console.log(`${timestamp} - ${level} - ${message}`);
@@ -197,7 +197,7 @@ async function processLead(lead, headers) {
   log("INFO", `Processing lead: ${mobile} / ${pancard}`);
 
   try {
-    // 1. Lead Verify - Dedupe API
+    // 1. Lead Verify - Dedupe API (Expected HTTP 201 on success, HTTP 400 with CUSTOMER_EXISTS if already exists)
     const verifyPayload = { mobile, pancard };
     log("INFO", `Sending Verify request for ${mobile} to ${LEAD_VERIFY_URL}`);
     
@@ -217,8 +217,7 @@ async function processLead(lead, headers) {
     const verifyData = verifyRes.data || {};
     log("INFO", `Lead Verify Response for ${mobile}: ${JSON.stringify(verifyData)}`);
 
-    // Check if customer already exists (success: false or message contains exists)
-    const customerExists = verifyData.success === false || (verifyData.message && verifyData.message.toLowerCase().includes("exist"));
+    const customerExists = verifyRes.status === 400 || verifyData.success === false || (verifyData.message && verifyData.message.toUpperCase().includes("EXIST"));
 
     if (customerExists) {
       log("WARN", `Customer already exists for ${mobile}. Skipping Lead Push.`);

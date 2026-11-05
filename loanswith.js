@@ -1,478 +1,264 @@
-const fs = require("fs");
+const { MongoClient } = require("mongodb");
 const axios = require("axios");
-const axiosRetry = (() => {
-  try {
-    return require("axios-retry").default || require("axios-retry");
-  } catch {
-    return null;
-  }
-})();
-const { MongoClient, ObjectId } = require("mongodb");
+const path = require("path");
 require("dotenv").config();
 
-// ==================== CONFIGURATION ==================== //
-
-const LOANWITHIN_URL = "https://loanwithin.com/apitoken/api/Form/ApplyLoan";
-
+// --- CONFIGURATION & CREDENTIALS --- //
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "coverloop";
+const LEAD_COLLECTION = "smcoll";
+const RESPONSE_COLLECTION = "aparampaar_responses";
+const LENDER_NAME = "aparampaar";
 
-const LEAD_COLLECTION = "sm";
-const RESPONSE_COLLECTION = "loanwithin";
+// Endpoint as per Aparampaar API Documentation
+const LEAD_API_URL = "https://us-central1-omozing-app-3968d.cloudfunctions.net/apiv2/app/pushlead";
 
-const LENDER_NAME = "loanwithin";
+// Exact Credentials & Referral Code Provided
+const X_USER_ID = "CoverMantra$3214";
+const X_API_KEY = "L5AYE43I55WZDOID";
+const REFERRAL_CODE = "COVERMANTRA01";
 
-const BATCH_SIZE = 100;
-const MAX_THREADS = 5;
-const MAX_RETRIES = 3;
-const RETRY_BACKOFF = 1.5;
-const REQUEST_TIMEOUT = 15000;
+// Major Cities Priority List (Inhe sabse pehle priority milegi)
+const PRIORITY_CITIES = [
+  "mumbai", "delhi", "bangalore", "hyderabad", 
+  "pune", "chennai", "kolkata", "gurgaon", "noida", "coimbatore"
+];
 
-const API_CALL_DELAY = 250;
-const BATCH_DELAY = 2000;
-const THREAD_DELAY = 100;
-const MAX_REQUESTS_PER_SECOND = 5;
-
-const MIN_AGE = 18;
-const MAX_AGE = 65;
-const MIN_INCOME = 15000;
-
-// ==================== LOGGING SETUP ==================== //
-
-const LOG_FILE = "loanwithin_processing.log";
-
-function log(level, message) {
-  const timestamp = new Date().toISOString().replace("T", " ").slice(0, 23);
-  const line = `${timestamp} [${level}] ${message}`;
-  console.log(line);
+// --- AGE CALCULATOR ---
+function calculateAge(dobString) {
+  if (!dobString) return null;
   try {
-    fs.appendFileSync(LOG_FILE, line + "\n");
-  } catch (e) {}
-}
-
-const logger = {
-  info: (msg) => log("INFO", msg),
-  warning: (msg) => log("WARNING", msg),
-  error: (msg) => log("ERROR", msg),
-  debug: (msg) => log("DEBUG", msg),
-};
-
-// ==================== MONGO SETUP ==================== //
-
-let mongoClient;
-let leadCol;
-let responseCol;
-
-async function connectMongo() {
-  if (!MONGO_URI) {
-    throw new Error("MONGO_URI_COVER is not defined in environment variables!");
-  }
-  mongoClient = new MongoClient(MONGO_URI);
-  await mongoClient.connect();
-  const db = mongoClient.db(DB_NAME);
-  leadCol = db.collection(LEAD_COLLECTION);
-  responseCol = db.collection(RESPONSE_COLLECTION);
-  logger.info("✅ Connected to MongoDB");
-}
-
-// ==================== MUTEX & RATE LIMITER ==================== //
-
-class Mutex {
-  constructor() {
-    this._locking = Promise.resolve();
-  }
-  lock() {
-    let unlockNext;
-    const willLock = new Promise((resolve) => (unlockNext = resolve));
-    const willUnlock = this._locking.then(() => unlockNext);
-    this._locking = this._locking.then(() => willLock);
-    return willUnlock;
-  }
-}
-
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-class RateLimiter {
-  constructor(maxRatePerSecond) {
-    this.maxRate = maxRatePerSecond > 0 ? maxRatePerSecond : 1;
-    this.minInterval = 1000 / this.maxRate;
-    this.lastCall = Date.now();
-    this.mutex = new Mutex();
-  }
-
-  async acquire() {
-    const unlock = await this.mutex.lock();
-    try {
-      const current = Date.now();
-      const elapsed = current - this.lastCall;
-      const waitTime = Math.max(0, this.minInterval - elapsed);
-      if (waitTime > 0) await sleep(waitTime);
-      this.lastCall = Date.now();
-    } finally {
-      unlock();
-    }
-  }
-}
-
-const rateLimiter = new RateLimiter(MAX_REQUESTS_PER_SECOND);
-
-class Counters {
-  constructor() {
-    this.successCount = 0;
-    this.traversedLeads = 0;
-    this.rejectedLeads = 0;
-    this.apiErrors = 0;
-  }
-  incrementSuccess(c = 1) { this.successCount += c; }
-  incrementTraversed(c = 1) { this.traversedLeads += c; }
-  incrementRejected(c = 1) { this.rejectedLeads += c; }
-  incrementApiErrors(c = 1) { this.apiErrors += c; }
-}
-
-const counters = new Counters();
-
-function makeProcessResult({ leadId, phone, pan, status, responses, success }) {
-  return { leadId, phone, pan, status, responses, success };
-}
-
-const axiosInstance = axios.create();
-if (axiosRetry) {
-  axiosRetry(axiosInstance, {
-    retries: MAX_RETRIES,
-    retryDelay: (retryCount) => Math.pow(RETRY_BACKOFF, retryCount) * 1000,
-    retryCondition: (error) => [429, 500, 502, 503, 504].includes(error.response?.status),
-  });
-}
-
-// ==================== VALIDATION FUNCTIONS ==================== //
-
-const INVALID_DATES = new Set(["0000-00-00", "01/01/1900", "01/01/0001", "1900-01-01", "01-01-1900", "1990-01-01"]);
-
-function calculateAge(dobValue) {
-  if (!dobValue || INVALID_DATES.has(String(dobValue).trim())) return 0;
-  try {
-    let dob = null;
-    if (dobValue instanceof Date) {
-      dob = dobValue;
-    } else {
-      let dobStr = String(dobValue).trim();
-      if (dobStr.includes("T")) dobStr = dobStr.split("T")[0];
-      if (!dobStr) return 0;
-
-      if (dobStr.includes("/") && dobStr.length <= 10) {
-        const parts = dobStr.split("/");
-        if (parts.length === 3 && parts[2].length === 4) {
-          const p0 = parseInt(parts[0], 10);
-          const p1 = parseInt(parts[1], 10);
-          const year = parseInt(parts[2], 10);
-          if (p0 >= 1 && p0 <= 12 && p1 >= 1 && p1 <= 31) dob = new Date(year, p0 - 1, p1);
-          else if (p1 >= 1 && p1 <= 12 && p0 >= 1 && p0 <= 31) dob = new Date(year, p1 - 1, p0);
-        }
-      }
-      if (!dob && dobStr.length === 10 && dobStr[4] === "-" && dobStr[7] === "-") {
-        const [year, month, day] = dobStr.split("-").map(Number);
-        dob = new Date(year, month - 1, day);
-      }
-      if (!dob && dobStr.length === 10 && dobStr[2] === "-" && dobStr[5] === "-") {
-        const parts = dobStr.split("-");
-        if (parts[2].length === 4) {
-          const [day, month, year] = parts.map(Number);
-          dob = new Date(year, month - 1, day);
-        }
-      }
-      if (!dob) return 0;
-    }
-
-    const today = new Date();
-    let age = today.getFullYear() - dob.getFullYear();
-    const beforeBirthday = today.getMonth() < dob.getMonth() || (today.getMonth() === dob.getMonth() && today.getDate() < dob.getDate());
-    if (beforeBirthday) age -= 1;
-    return age > 0 && age < 120 ? age : 0;
+    const dob = new Date(dobString);
+    if (isNaN(dob.getTime())) return null;
+    const diffMs = Date.now() - dob.getTime();
+    return Math.abs(new Date(diffMs).getUTCFullYear() - 1970);
   } catch (e) {
-    return 0;
+    return null;
   }
 }
 
-function pad2(n) { return String(n).padStart(2, "0"); }
-function pad4(n) { return String(n).padStart(4, "0"); }
-
-function formatDob(dobValue) {
-  if (!dobValue) return "1990-05-15";
-  try {
-    if (dobValue instanceof Date) {
-      return `${pad4(dobValue.getFullYear())}-${pad2(dobValue.getMonth() + 1)}-${pad2(dobValue.getDate())}`;
-    }
-    let dobStr = String(dobValue).trim();
-    if (dobStr.includes("T")) dobStr = dobStr.split("T")[0];
-    if (dobStr.length === 10 && dobStr[4] === "-" && dobStr[7] === "-") return dobStr;
-    const age = calculateAge(dobValue);
-    if (age > 0) {
-      if (dobStr.includes("/")) {
-        const parts = dobStr.split("/");
-        if (parts.length === 3) {
-          const month = parseInt(parts[0], 10);
-          const day = parseInt(parts[1], 10);
-          const year = parseInt(parts[2], 10);
-          if (month >= 1 && month <= 12 && day >= 1 && day <= 31) return `${pad4(year)}-${pad2(month)}-${pad2(day)}`;
-          else if (day >= 1 && day <= 12 && month >= 1 && month <= 31) return `${pad4(year)}-${pad2(day)}-${pad2(month)}`;
-        }
-      }
-    }
-    return "1990-05-15";
-  } catch (e) {
-    return "1990-05-15";
+// --- VALIDATION RULES ---
+function shouldSkip(lead) {
+  const required = ["phone", "pan", "pincode", "dob", "employment", "income", "name"];
+  for (const field of required) {
+    if (!lead[field]) return "MISSING_REQUIRED_FIELD";
   }
-}
 
-function isDigitsOnly(str) { return /^\d+$/.test(String(str)); }
+  // 1. Strictly Exclude Jammu & Kashmir / J&K
+  const state = (lead.state || "").trim().toLowerCase();
+  const pincodeStr = String(lead.pincode || "").trim();
+  if (
+    state.includes("jammu") || 
+    state.includes("kashmir") || 
+    state === "j&k" || 
+    state === "jk" ||
+    pincodeStr.startsWith("18") || 
+    pincodeStr.startsWith("19")
+  ) {
+    return "EXCLUDED_STATE_JK";
+  }
 
-function validateLead(lead) {
-  if (!lead.phone || !isDigitsOnly(lead.phone) || String(lead.phone).length !== 10) return [false, "invalid_phone", 0];
-  if (!lead.pan || ![10, 12].includes(String(lead.pan).length)) return [false, "invalid_pan", 0];
-  if (!lead.pincode || !isDigitsOnly(lead.pincode) || String(lead.pincode).length !== 6) return [false, "invalid_pincode", 0];
+  // 2. Employment Type: Strictly Salaried Only
+  const emp = (lead.employment || "").trim().toLowerCase();
+  if (emp !== "salaried") {
+    return "INVALID_EMPLOYMENT_NOT_SALARIED";
+  }
 
+  // 3. Income Validation: Between ₹60,000 and ₹1,00,000
+  const incomeVal = parseFloat(lead.income || 0);
+  if (isNaN(incomeVal) || incomeVal < 60000 || incomeVal > 100000) {
+    return "INVALID_INCOME_RANGE_60K_1L";
+  }
+
+  // 4. Age Validation: 22 to 58 years
   const age = calculateAge(lead.dob);
-  if (age === 0) return [false, "invalid_dob", age];
-  if (age < MIN_AGE) return [false, "age_too_young", age];
-  if (age > MAX_AGE) return [false, "age_too_old", age];
-
-  let incomeValue;
-  try {
-    incomeValue = parseFloat(String(lead.income || "0").replace(/,/g, "").trim());
-    if (isNaN(incomeValue)) throw new Error("NaN");
-  } catch (e) {
-    return [false, "invalid_income", age];
+  if (age === null || age < 22 || age > 58) {
+    return "INVALID_AGE_RANGE";
   }
-  if (incomeValue < MIN_INCOME) return [false, "low_income", age];
 
-  return [true, null, age];
+  return false;
 }
 
-// ==================== API REQUEST HANDLING ==================== //
-
-async function sendLoanwithinRequest(lead) {
-  const headers = { "Content-Type": "application/json", "User-Agent": "CoverMantra/1.0" };
+// --- PAYLOAD BUILDER (Income cleaned without .0) ---
+function buildPayload(lead) {
+  const dobFormatted = lead.dob ? String(lead.dob).split("T")[0] : "1990-05-21";
   
-  const payload = {
-    LoanAmount: parseFloat(lead.loan_amount) || 500000.00,
-    Monthly_Income: parseFloat(lead.income) || 75000,
-    Loan_Purpose: 1,
-    Cus_Name: String(lead.name || "John Doe").trim(),
-    Cus_Email: String(lead.email || "john.doe@example.com").trim(),
-    Cus_mobile: String(lead.phone || "9876543210").trim(),
-    Cus_DOB: formatDob(lead.dob),
-    Cus_PAN: String(lead.pan || "ABCDE1234F").toUpperCase().trim(),
-    Gender: lead.gender && String(lead.gender).toLowerCase() === "female" ? "2" : "1",
-    StateName: String(lead.state || "Maharashtra").trim(),
-    CityName: String(lead.city || "Mumbai").trim(),
-    Cus_PIN: String(lead.pincode || "400001").trim(),
-    Employment: lead.employment && String(lead.employment).toLowerCase().includes("self") ? "2" : "1"
+  // Income se .0 ya decimal hatane ke liye Math.trunc ka use kiya hai
+  const cleanIncome = lead.income ? String(Math.trunc(parseFloat(lead.income))) : "70000";
+  
+  return {
+    "full_name": String(lead.name || "John Doe").trim(),
+    "mobile_number": String(lead.phone).trim(),
+    "email_id": String(lead.email || "johndoe@gmail.com").trim(),
+    "pan": String(lead.pan).trim().toUpperCase(),
+    "salary": cleanIncome,
+    "loan_amount": String(lead.loan_amount || "150050"),
+    "quality_score": String(lead.quality_score || "600"),
+    "Referral_Code": REFERRAL_CODE,
+    "city": String(lead.city || "Mumbai").trim(),
+    "state": String(lead.state || "Maharashtra").trim(),
+    "company_type": lead.company_type || "Private Limited",
+    "job_type": "Salaried Professional",
+    "current_work": lead.current_work || "Tech Solutions",
+    "designation": lead.designation || "Software Engineer",
+    "date_of_birth": dobFormatted
   };
+}
+
+// --- PROCESS LEAD ---
+async function processLead(item, leadCol, responseCol) {
+  const skipReason = shouldSkip(item);
+  if (skipReason) {
+    await leadCol.updateOne({ _id: item._id }, { $addToSet: { processed: `${LENDER_NAME}: skipped_${skipReason}` } });
+    return { success: false, skipped: true };
+  }
+
+  const payload = buildPayload(item);
+  const cleanIncomeForDb = payload.salary; // Cleaned salary without .0
 
   try {
-    await rateLimiter.acquire();
-    if (API_CALL_DELAY > 0) await sleep(API_CALL_DELAY);
-
-    const response = await axiosInstance.post(LOANWITHIN_URL, payload, {
-      headers,
-      timeout: REQUEST_TIMEOUT,
-      validateStatus: () => true,
+    const res = await axios.post(LEAD_API_URL, payload, {
+      headers: {
+        "Content-Type": "application/json",
+        "x-api-key": X_API_KEY,
+        "x-user-id": X_USER_ID
+      },
+      timeout: 30000
     });
 
-    return [response.data, response.status];
-  } catch (e) {
-    if (e.code === "ECONNABORTED") return [{ error: "Timeout" }, 408];
-    if (e.response) return [e.response.data, e.response.status];
-    return [{ error: e.message }, 500];
-  }
-}
+    const apiResponse = res.data || {};
+    const isSuccess = apiResponse.success === true;
 
-async function processSingleLead(lead) {
-  try {
-    const [isValid, rejectionReason, age] = validateLead(lead);
-    if (!isValid) {
-      counters.incrementTraversed();
-      counters.incrementRejected();
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: `skipped_${rejectionReason}`,
-        responses: { validation_error: rejectionReason, age },
-        success: false,
-      });
-    }
-
-    const [respData] = await sendLoanwithinRequest(lead);
-    counters.incrementTraversed();
-
-    const isSuccess = respData && 
-                      respData.isSussess === true && 
-                      respData.result === "OK" && 
-                      respData.refNo && 
-                      String(respData.refNo).trim() !== "";
+    await responseCol.insertOne({
+      phone: item.phone,
+      pan: item.pan,
+      income: cleanIncomeForDb, // Bina .0 wali clean income save hogi
+      status: isSuccess ? "SUCCESS" : "FAILED",
+      api_response: apiResponse,
+      createdAt: new Date().toISOString().slice(0, 10)
+    });
 
     if (isSuccess) {
-      counters.incrementSuccess();
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: "success",
-        responses: respData,
-        success: true,
-      });
+      await leadCol.updateOne({ _id: item._id }, { $addToSet: { processed: LENDER_NAME } });
+      console.log(`✅ Success lead processed: ${item.phone} (${item.city || 'NA'}) | Income: ${cleanIncomeForDb}`);
+      return { success: true, skipped: false };
     } else {
-      return makeProcessResult({
-        leadId: String(lead._id),
-        phone: String(lead.phone),
-        pan: lead.pan || "",
-        status: "failed",
-        responses: respData,
-        success: false,
-      });
+      console.warn(`⚠️ Lead rejected/duplicate for ${item.phone}:`, apiResponse.message);
+      await leadCol.updateOne({ _id: item._id }, { $addToSet: { processed: `${LENDER_NAME}: ${apiResponse.error_code || 'FAILED'}` } });
+      return { success: false, skipped: false };
     }
-  } catch (e) {
-    counters.incrementTraversed();
-    counters.incrementApiErrors();
-    return makeProcessResult({
-      leadId: String(lead._id),
-      phone: String(lead.phone),
-      pan: lead.pan || "",
-      status: "processing_error",
-      responses: { error: e.message },
-      success: false,
+
+  } catch (err) {
+    const errData = err.response ? err.response.data : { message: err.message };
+    console.error(`❌ API Error for ${item.phone}:`, JSON.stringify(errData));
+    
+    await responseCol.insertOne({
+      phone: item.phone,
+      pan: item.pan,
+      income: cleanIncomeForDb, // Yahan bhi bina .0 wali income jayegi
+      status: "FAILED",
+      api_response: errData,
+      createdAt: new Date().toISOString().slice(0, 10)
     });
+    return { success: false, skipped: false };
   }
 }
 
-async function runBatchConcurrently(leadsBatch) {
-  const results = [];
-  const concurrency = Math.min(MAX_THREADS, leadsBatch.length);
-  let nextIndex = 0;
-
-  async function worker() {
-    while (true) {
-      const currentIndex = nextIndex++;
-      if (currentIndex >= leadsBatch.length) return;
-      const currentLead = leadsBatch[currentIndex];
-      try {
-        const result = await Promise.race([
-          processSingleLead(currentLead),
-          sleep(30000).then(() => { throw new Error("Timeout"); }),
-        ]);
-        if (result) results.push(result);
-      } catch (e) {
-        counters.incrementApiErrors();
-      }
-    }
-  }
-
-  const workers = [];
-  for (let w = 0; w < concurrency; w++) {
-    workers.push(worker());
-    if (w < concurrency - 1) await sleep(THREAD_DELAY);
-  }
-  await Promise.all(workers);
-  return results;
-}
-
-async function processBatch(leadsBatch, batchNumber) {
-  const results = await runBatchConcurrently(leadsBatch);
-  await saveResults(results);
-
-  const successfulCount = results.filter((r) => r.success).length;
-  logger.info(`✅ BATCH ${batchNumber} COMPLETE (Success: ${successfulCount}/${leadsBatch.length})`);
-  return results.length;
-}
-
-async function saveResults(results) {
-  if (!results.length) return;
-  try {
-    const apiDocuments = results.map((result) => ({
-      leadId: result.leadId,
-      phone: result.phone,
-      pan: result.pan,
-      status: result.status,
-      responses: result.responses,
-      createdAt: new Date().toISOString().split("T")[0],
-    }));
-
-    if (apiDocuments.length > 0) {
-      await responseCol.insertMany(apiDocuments, { ordered: false });
-    }
-
-    for (const result of results) {
-      let tag = LENDER_NAME;
-      if (result.status.startsWith("skipped_")) {
-        const skipReason = result.status.replace("skipped_", "");
-        tag = `${LENDER_NAME}: skipped_${skipReason}`;
-      }
-
-      await leadCol.updateOne(
-        { _id: new ObjectId(result.leadId) },
-        { $pull: { processed: {$regex: `^${LENDER_NAME}`, $options: "i" } } }
-      );
-      await leadCol.updateOne(
-        { _id: new ObjectId(result.leadId) },
-        { $addToSet: { processed: tag } }
-      );
-    }
-  } catch (e) {
-    logger.error(`❌ Database save error: ${e.message}`);
-  }
-}
-
+// --- MAIN FUNCTION ---
 async function main() {
-  await connectMongo();
-  logger.info("⚡ LOANWITHIN BATCH PROCESSING STARTED");
+  if (!MONGO_URI) {
+    console.error("❌ MONGO_URI_COVER is missing in .env file!");
+    return;
+  }
 
+  const client = new MongoClient(MONGO_URI);
   try {
+    await client.connect();
+    console.log("✅ Connected to MongoDB Successfully.");
+    
+    const db = client.db(DB_NAME);
+    const leadCol = db.collection(LEAD_COLLECTION);
+    const responseCol = db.collection(RESPONSE_COLLECTION);
+
+    const totalInCollection = await leadCol.countDocuments({});
+    const alreadyProcessedCount = await leadCol.countDocuments({ processed: { $regex: /aparampaar/i } });
+    console.log(`📊 Total Leads in '${LEAD_COLLECTION}': ${totalInCollection}`);
+    console.log(`📊 Already Processed for Aparampaar: ${alreadyProcessedCount}`);
+    console.log(`📊 Remaining Leads to Process: ${totalInCollection - alreadyProcessedCount}\n`);
+
     const query = {
       $or: [
         { processed: { $exists: false } },
-        { processed: { $regex: `^((?!${LENDER_NAME}).)*$`, $options: "i" } },
-      ],
+        { processed: { $not: { $regex: /aparampaar/i } } }
+      ]
     };
 
-    logger.info("Fetching unprocessed leads from MongoDB...");
-    const leads = await leadCol.find(query, { projection: { name: 1, gender: 1, phone: 1, pan: 1, dob: 1, employment: 1, income: 1, pincode: 1, city: 1, state: 1, email: 1, loan_amount: 1 } }).toArray();
-    logger.info(`📊 Total Unprocessed Leads Found: ${leads.length}`);
+    const leads = await leadCol.find(query).toArray();
+    
+    leads.sort((a, b) => {
+      const cityA = (a.city || "").trim().toLowerCase();
+      const cityB = (b.city || "").trim().toLowerCase();
+      
+      const indexA = PRIORITY_CITIES.indexOf(cityA);
+      const indexB = PRIORITY_CITIES.indexOf(cityB);
+      
+      if (indexA !== -1 && indexB !== -1) return indexA - indexB;
+      if (indexA !== -1) return -1;
+      if (indexB !== -1) return 1;
+      return 0;
+    });
 
-    let totalProcessedOverall = 0;
-    let batchNum = 1;
+    let totalScanned = 0, processedCount = 0, skippedCount = 0, failedCount = 0;
     let batch = [];
 
-    for (let i = 0; i < leads.length; i++) {
-      batch.push(leads[i]);
+    for (const lead of leads) {
+      totalScanned++;
+      batch.push(lead);
 
-      if (batch.length === BATCH_SIZE || i === leads.length - 1) {
-        logger.info(`🚀 Processing batch ${batchNum} (${batch.length} leads)... Progress: ${i + 1}/${leads.length}`);
-        
-        const processedCountInBatch = await processBatch(batch, batchNum);
-        totalProcessedOverall += processedCountInBatch;
-
-        logger.info(`📊 TOTAL PROCESSED SO FAR: ${totalProcessedOverall}`);
-
-        batch = [];
-        batchNum++;
-        if (i < leads.length - 1) {
-          await sleep(BATCH_DELAY);
+      if (batch.length === 100) {
+        console.log(`\n🚀 Processing batch of 100... Progress: ${totalScanned}/${leads.length}`);
+        for (const item of batch) {
+          const result = await processLead(item, leadCol, responseCol);
+          if (result.success) {
+            processedCount++;
+          } else if (result.skipped) {
+            skippedCount++;
+          } else {
+            failedCount++;
+          }
+          await new Promise(r => setTimeout(r, 200));
         }
+        batch = [];
+        await new Promise(r => setTimeout(r, 1000));
       }
     }
 
-    logger.info("🎯 PROCESSING COMPLETE!");
-    logger.info(`   • Total Processed: ${totalProcessedOverall}`);
-  } catch (e) {
-    logger.error(`❌ Main execution error: ${e.message}`);
-  } finally {
-    if (mongoClient) {
-      await mongoClient.close();
+    if (batch.length > 0) {
+      console.log(`\n🚀 Processing final batch... Remaining: ${batch.length}`);
+      for (const item of batch) {
+        const result = await processLead(item, leadCol, responseCol);
+        if (result.success) {
+          processedCount++;
+        } else if (result.skipped) {
+          skippedCount++;
+        } else {
+          failedCount++;
+        }
+        await new Promise(r => setTimeout(r, 200));
+      }
     }
-    logger.info("🔚 Processing finished");
+
+    console.log(`\n================ SUMMARY ================\n` +
+                `TOTAL SCANNED THIS RUN: ${totalScanned}\n` +
+                `SUCCESSFULLY PROCESSED: ${processedCount}\n` +
+                `SKIPPED (VALIDATION FAILED): ${skippedCount}\n` +
+                `FAILED (API ERROR / REJECTED): ${failedCount}\n` +
+                `=========================================`);
+    
+    await client.close();
+  } catch (err) {
+    console.error(`Fatal error: ${err.message}`);
+    if (client) await client.close();
   }
 }
 
