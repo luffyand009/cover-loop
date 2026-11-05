@@ -192,7 +192,7 @@ async function createCustomer(user, preApprovalAmount) {
         State: state,
         "Type of Accommodation": String(user.accommodationType || "Own"),
         PAN: panNo,
-        Aadhaar: userAadhaar,
+        Aadhaar: "[Aadhaar Redacted]",
         "Highest Qualification": String(user.qualification || "Postgraduate"),
         residing_with: String(user.residingWith || "Family"),
         number_of_years_at_current_address: String(user.yearsAtAddress || "More than five years"),
@@ -248,7 +248,7 @@ async function createCustomer(user, preApprovalAmount) {
           pc: pinCode,
           po: String(user.poaPo || "Main Post Office"),
         },
-        aadhar_no: userAadhaar,
+        aadhar_no: "[Aadhaar Redacted]",
         name: `${firstName} ${lastName}`,
         dob: formattedDob,
         gender: formatGenderShort(user.gender),
@@ -315,58 +315,47 @@ async function processCasheLead(lead) {
   };
 }
 
-// Individual Worker Loop to process records independently
+// Individual Worker Loop using atomic findOneAndUpdate to prevent duplicate hits
 async function workerLoop(workerId) {
   console.log(`👷 Worker #${workerId} started...`);
   try {
     while (true) {
-      const leads = await UserDB.aggregate([
-        {
-          $match: {
-            "RefArr.name": { $nin: ["cashe"] },
-          },
-        },
-        { $limit: BATCH_SIZE },
-      ]);
+      // Atomic lock & fetch to prevent race conditions across parallel workers
+      const lead = await UserDB.findOneAndUpdate(
+        { "RefArr.name": { $nin: ["cashe"] } },
+        { $push: { RefArr: { name: "cashe", createdAt: new Date().toISOString() } } },
+        { sort: { _id: 1 }, returnDocument: "after" }
+      );
 
-      if (leads.length === 0) {
+      if (!lead) {
         console.log(`✅ Worker #${workerId}: No more leads to process. Exiting worker.`);
         break;
       }
 
-      for (const lead of leads) {
-        const mobileNumber = lead.phone || lead.mobile || lead.contact;
-        if (!mobileNumber) {
-          await UserDB.updateOne(
-            { _id: lead._id },
-            { $push: { RefArr: { name: "cashe", createdAt: new Date().toISOString() } } }
-          );
-          continue;
-        }
-
-        console.log(`⚙️ [Worker #${workerId}] Processing: ${mobileNumber}`);
-        const apiResult = await processCasheLead(lead);
-
-        const updateDoc = {
-          $push: {
-            apiResponse: {
-              name: "cashe",
-              ...apiResult.casheData,
-              createdAt: new Date().toISOString(),
-            },
-            RefArr: {
-              name: "cashe",
-              createdAt: new Date().toISOString(),
-            },
-          },
-        };
-
-        await UserDB.updateOne({ _id: lead._id }, updateDoc);
-
-        globalSuccessCount++;
-        globalTotalLeads++;
-        console.log(`✅ [Worker #${workerId}] Done: ${mobileNumber} [Status: ${apiResult.status}] (Total Success: ${globalSuccessCount})`);
+      const mobileNumber = lead.phone || lead.mobile || lead.contact;
+      if (!mobileNumber) {
+        console.log(`⚠️ [Worker #${workerId}] Phone missing for lead ID: ${lead._id}, skipping.`);
+        continue;
       }
+
+      console.log(`⚙️ [Worker #${workerId}] Processing: ${mobileNumber}`);
+      const apiResult = await processCasheLead(lead);
+
+      const updateDoc = {
+        $push: {
+          apiResponse: {
+            name: "cashe",
+            ...apiResult.casheData,
+            createdAt: new Date().toISOString(),
+          },
+        },
+      };
+
+      await UserDB.updateOne({ _id: lead._id }, updateDoc);
+
+      globalSuccessCount++;
+      globalTotalLeads++;
+      console.log(`✅ [Worker #${workerId}] Done: ${mobileNumber} [Status: ${apiResult.status}] (Total Success: ${globalSuccessCount})`);
 
       await new Promise((resolve) => setTimeout(resolve, DELAY_MS));
     }
