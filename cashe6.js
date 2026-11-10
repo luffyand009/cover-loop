@@ -10,7 +10,7 @@ const MONGO_URI = process.env.MONGO_URI_COVER;
 
 const DB_NAME = "coverloop";
 const LEAD_COLLECTION = "payme4"; // Jaha se data uthega
-const RESPONSE_COLLECTION = "cashe_responses3"; // Jaha response save hoga
+const RESPONSE_COLLECTION = "cashe_responses4"; // Jaha response save hoga
 const LENDER_NAME = "cashe";
 
 // CASHe API URLs & Credentials
