@@ -9,7 +9,7 @@ require("dotenv").config();
 const MONGO_URI = process.env.MONGO_URI_COVER;
 
 const DB_NAME = "coverloop";
-const LEAD_COLLECTION = "payme3"; // Jaha se data uthega
+const LEAD_COLLECTION = "payme4"; // Jaha se data uthega
 const RESPONSE_COLLECTION = "cashe_responses3"; // Jaha response save hoga
 const LENDER_NAME = "cashe";
 
