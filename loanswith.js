@@ -22,7 +22,7 @@ const RESPONSE_COLLECTION = "loanwithin";
 
 const LENDER_NAME = "loanwithin";
 
-const BATCH_SIZE = 100;
+const BATCH_SIZE = 10;
 const MAX_THREADS = 5;
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
