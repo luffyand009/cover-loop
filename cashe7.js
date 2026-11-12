@@ -13,7 +13,7 @@ const LEAD_COLLECTION = "payme4"; // Jaha se data uthega
 const RESPONSE_COLLECTION = "cashe_responses4"; // Jaha response save hoga
 const LENDER_NAME = "cashe";
 
-// CASHe API URLs & Credentials (Pre-Approval URL hata di gayi hai)
+// CASHe API URLs & Credentials
 const BASE_URL = "https://partners.cashe.co.in";
 const DUPLICATE_CHECK_URL = `${BASE_URL}/partner/checkDuplicateCustomerLead`;
 const CREATE_CUSTOMER_URL = `${BASE_URL}/partner/create_customer`;
@@ -56,7 +56,7 @@ function loadValidPincodes() {
 const allowedPincodes = loadValidPincodes();
 
 const BATCH_SIZE = 50;       // MongoDB se ek baar mein 50 records uthane hain
-const CONCURRENCY_LIMIT = 10; // 10 leads ek sath parallel
+const CONCURRENCY_LIMIT = 10; // 🚀 10 leads ek sath parallel (10 loops)
 const REQUEST_TIMEOUT = 30000;
 
 let currentActiveRequests = 0; // Track karega ki kitni APIs exact time par chal rahi hain
@@ -128,7 +128,7 @@ function shouldSkip(lead) {
   return false;
 }
 
-// CASHe 2-Step API Workflow Controller (Duplicate Check -> Create Customer)
+// CASHe API Workflow Controller (Duplicate Check -> Create Customer)
 async function processLead(item, leadCol, responseCol) {
   currentActiveRequests++;
   const mobile = item.phone || item.mobile || item.contact || "";
@@ -189,11 +189,13 @@ async function processLead(item, leadCol, responseCol) {
       return false;
     }
 
-    // 2. Create Customer API (Pre-Approval hata kar direct create customer)
+    // 2. Create Customer API 
     const { firstName, lastName } = parseName(item.name);
     const formattedDob = formatDOBCasheDDMMYYYY(item.dob);
     const loanAmt = String(item.loanAmount || 50000);
-    const userAadhaar = String(item.aadhaar || "[Aadhaar Redacted]");
+    
+    // Fallback 12-digit string agar database mein aadhaar nahi hai
+    const userAadhaar = String(item.aadhaar || "123456789012");
 
     const createPayload = {
       partner_name: PARTNER_NAME,
@@ -336,7 +338,7 @@ function chunkArray(array, size) {
   return chunks;
 }
 
-// Helper: Chunks ko parallel chalane ke liye
+// Helper: Chunks ko parallel chalane ke liye (10 at a time)
 async function processBatchConcurrently(batchLeads, leadCol, responseCol, concurrencyLimit) {
   const chunks = chunkArray(batchLeads, concurrencyLimit);
   let processedCount = 0;
