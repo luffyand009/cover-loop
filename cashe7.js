@@ -9,14 +9,13 @@ require("dotenv").config();
 const MONGO_URI = process.env.MONGO_URI_COVER;
 
 const DB_NAME = "coverloop";
-const LEAD_COLLECTION = "payme5"; // Jaha se data uthega
-const RESPONSE_COLLECTION = "cashe_responses5"; // Jaha response save hoga
+const LEAD_COLLECTION = "payme4"; // Jaha se data uthega
+const RESPONSE_COLLECTION = "cashe_responses4"; // Jaha response save hoga
 const LENDER_NAME = "cashe";
 
-// CASHe API URLs & Credentials
+// CASHe API URLs & Credentials (Pre-Approval URL hata di gayi hai)
 const BASE_URL = "https://partners.cashe.co.in";
 const DUPLICATE_CHECK_URL = `${BASE_URL}/partner/checkDuplicateCustomerLead`;
-const PRE_APPROVAL_URL = `${BASE_URL}/report/getLoanApprovalDetails`;
 const CREATE_CUSTOMER_URL = `${BASE_URL}/partner/create_customer`;
 
 const PARTNER_NAME = "Covermantra_API";
@@ -57,7 +56,7 @@ function loadValidPincodes() {
 const allowedPincodes = loadValidPincodes();
 
 const BATCH_SIZE = 50;       // MongoDB se ek baar mein 50 records uthane hain
-const CONCURRENCY_LIMIT = 10; // 🚀 Yahan 10 kar diya hai (10 leads ek sath parallel)
+const CONCURRENCY_LIMIT = 10; // 10 leads ek sath parallel
 const REQUEST_TIMEOUT = 30000;
 
 let currentActiveRequests = 0; // Track karega ki kitni APIs exact time par chal rahi hain
@@ -84,16 +83,6 @@ function parseName(fullName = "") {
   const firstName = parts[0] || "User";
   const lastName = parts.slice(1).join(" ") || "Kumar";
   return { firstName, lastName };
-}
-
-function formatDOBCashe(dobStr) {
-  if (!dobStr) return "1995-01-01 00:00:00";
-  const date = new Date(dobStr);
-  if (isNaN(date.getTime())) return "1995-01-01 00:00:00";
-  const yyyy = date.getFullYear();
-  const mm = String(date.getMonth() + 1).padStart(2, "0");
-  const dd = String(date.getDate()).padStart(2, "0");
-  return `${yyyy}-${mm}-${dd} 00:00:00`;
 }
 
 function formatDOBCasheDDMMYYYY(dobStr) {
@@ -139,7 +128,7 @@ function shouldSkip(lead) {
   return false;
 }
 
-// CASHe Multi-Step API Workflow Controller
+// CASHe 2-Step API Workflow Controller (Duplicate Check -> Create Customer)
 async function processLead(item, leadCol, responseCol) {
   currentActiveRequests++;
   const mobile = item.phone || item.mobile || item.contact || "";
@@ -200,65 +189,10 @@ async function processLead(item, leadCol, responseCol) {
       return false;
     }
 
-    // 2. Pre-Approval API
+    // 2. Create Customer API (Pre-Approval hata kar direct create customer)
     const { firstName, lastName } = parseName(item.name);
-    const preApprovalPayload = {
-      partner_name: PARTNER_NAME,
-      pan: String(item.pan || item.pancard || "ABCDE1234F").toUpperCase(),
-      mobileNo: String(mobile),
-      name: `${firstName} ${lastName}`,
-      addressLine1: String(item.address || "Main Road"),
-      locality: String(item.locality || "Sector 1"),
-      pinCode: String(item.pincode || "125055"),
-      gender: formatGenderShort(item.gender),
-      salary: Number(item.income || item.salary || 35000),
-      state: String(item.state || "HARYANA").toUpperCase(),
-      city: String(item.city || "Fatehabad"),
-      dob: formatDOBCashe(item.dob),
-      employmentType: 1,
-      salaryReceivedType: 3,
-      emailId: String(email),
-      companyName: String(item.companyName || "TechCorp"),
-      loanAmount: Number(item.loanAmount || 50000),
-    };
-
-    const preApprovalRes = await axios.post(PRE_APPROVAL_URL, preApprovalPayload, {
-      headers: getHeaders(preApprovalPayload),
-      timeout: REQUEST_TIMEOUT,
-    });
-
-    const preApprovalData = preApprovalRes.data || {};
-    casheResponseObj.PreApproval = preApprovalData;
-
-    const approvalAmount = preApprovalData?.payLoad?.amount;
-    const approvalStatus = preApprovalData?.payLoad?.status;
-
-    const isAmountValid = approvalAmount !== null && approvalAmount !== undefined && approvalStatus !== "rejected";
-
-    if (!isAmountValid) {
-      log("WARN", `Pre-approval amount null or rejected for ${mobile}`);
-      
-      await responseCol.insertOne({
-        phone: mobile,
-        name: item.name || "",
-        pan: item.pan || "",
-        status: "PRE_APPROVAL_REJECTED",
-        api_response: casheResponseObj,
-        createdAt: new Date().toISOString().slice(0, 10)
-      });
-
-      await leadCol.updateOne(
-        { _id: item._id },
-        { $addToSet: { processed: `${LENDER_NAME}: PRE_APPROVAL_REJECTED` } }
-      );
-      currentActiveRequests--;
-      log("INFO", `🔴 [END-REJECTED] Lead: ${mobile} | Active Requests: ${currentActiveRequests}`);
-      return false;
-    }
-
-    // 3. Create Customer API
     const formattedDob = formatDOBCasheDDMMYYYY(item.dob);
-    const loanAmt = String(approvalAmount || item.loanAmount || 50000);
+    const loanAmt = String(item.loanAmount || 50000);
     const userAadhaar = String(item.aadhaar || "[Aadhaar Redacted]");
 
     const createPayload = {
@@ -418,7 +352,7 @@ async function processBatchConcurrently(batchLeads, leadCol, responseCol, concur
       if (success) processedCount++;
     });
 
-    await new Promise(r => setTimeout(r, 50)); // Thoda kam delay rakha hai taaki speed fast rahe
+    await new Promise(r => setTimeout(r, 50));
   }
 
   return processedCount;

@@ -22,7 +22,7 @@ const RESPONSE_COLLECTION = "loanwithin";
 
 const LENDER_NAME = "loanwithin";
 
-const BATCH_SIZE = 10;
+const BATCH_SIZE = 100;
 const MAX_THREADS = 5;
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
@@ -33,9 +33,22 @@ const BATCH_DELAY = 2000;
 const THREAD_DELAY = 100;
 const MAX_REQUESTS_PER_SECOND = 5;
 
-const MIN_AGE = 18;
-const MAX_AGE = 65;
-const MIN_INCOME = 15000;
+// ==================== ELIGIBILITY CRITERIA CONSTANTS ==================== //
+const MIN_AGE = 21;
+const MAX_AGE = 58;
+const MIN_CIBIL = 600;
+
+// 7 Metro Cities (Min Salary: 45,000)
+const METRO_CITIES = new Set([
+  "delhi", "delhi ncr", "mumbai", "bengaluru", "bangalore", 
+  "chennai", "ahmedabad", "hyderabad", "pune"
+]);
+
+// Tier 2 Cities & Others (Min Salary: 30,000)
+const TIER2_CITIES = new Set([
+  "coimbatore", "jaipur", "indore", "lucknow", 
+  "surat", "nagpur", "bhopal", "ranchi", "bhubaneswar", "kolkata"
+]);
 
 // ==================== LOGGING SETUP ==================== //
 
@@ -146,7 +159,7 @@ if (axiosRetry) {
   });
 }
 
-// ==================== VALIDATION FUNCTIONS ==================== //
+// ==================== VALIDATION & ELIGIBILITY FUNCTIONS ==================== //
 
 const INVALID_DATES = new Set(["0000-00-00", "01/01/1900", "01/01/0001", "1900-01-01", "01-01-1900", "1990-01-01"]);
 
@@ -233,11 +246,19 @@ function validateLead(lead) {
   if (!lead.pan || ![10, 12].includes(String(lead.pan).length)) return [false, "invalid_pan", 0];
   if (!lead.pincode || !isDigitsOnly(lead.pincode) || String(lead.pincode).length !== 6) return [false, "invalid_pincode", 0];
 
+  // 1. Age Check (21 to 58)
   const age = calculateAge(lead.dob);
   if (age === 0) return [false, "invalid_dob", age];
   if (age < MIN_AGE) return [false, "age_too_young", age];
   if (age > MAX_AGE) return [false, "age_too_old", age];
 
+  // 2. CIBIL Check (Minimum Score: 600)
+  if (lead.civis !== undefined || lead.cibil !== undefined) {
+    const cibilVal = parseInt(lead.cibil || lead.civis || "0", 10);
+    if (cibilVal > 0 && cibilVal < MIN_CIBIL) return [false, "low_cibil", age];
+  }
+
+  // 3. Income & City Tier Eligibility Check
   let incomeValue;
   try {
     incomeValue = parseFloat(String(lead.income || "0").replace(/,/g, "").trim());
@@ -245,7 +266,18 @@ function validateLead(lead) {
   } catch (e) {
     return [false, "invalid_income", age];
   }
-  if (incomeValue < MIN_INCOME) return [false, "low_income", age];
+
+  const cityName = String(lead.city || "").trim().toLowerCase();
+  
+  // Salary Eligibility: 45k for Metro, 30k for Tier 2 & Others
+  let minRequiredIncome = 30000; 
+  if (METRO_CITIES.has(cityName)) {
+    minRequiredIncome = 45000; 
+  }
+
+  if (incomeValue < minRequiredIncome) {
+    return [false, `low_income_for_city_${cityName}`, age];
+  }
 
   return [true, null, age];
 }
@@ -255,14 +287,16 @@ function validateLead(lead) {
 async function sendLoanwithinRequest(lead) {
   const headers = { "Content-Type": "application/json", "User-Agent": "CoverMantra/1.0" };
   
-  let genderVal = "male";
-  if (lead.gender && String(lead.gender).toLowerCase().includes("female")) {
-    genderVal = "female";
-  }
-
   let employmentVal = "Salaried";
   if (lead.employment && String(lead.employment).toLowerCase().includes("self")) {
     employmentVal = "Self";
+  } else if (lead.employment) {
+    employmentVal = String(lead.employment).trim();
+  }
+
+  let genderVal = "male";
+  if (lead.gender && String(lead.gender).toLowerCase().includes("female")) {
+    genderVal = "female";
   }
 
   const payload = {
@@ -448,7 +482,7 @@ async function main() {
     };
 
     logger.info("Fetching unprocessed leads from MongoDB...");
-    const leads = await leadCol.find(query, { projection: { name: 1, gender: 1, phone: 1, pan: 1, dob: 1, employment: 1, income: 1, pincode: 1, city: 1, state: 1, email: 1 } }).toArray();
+    const leads = await leadCol.find(query, { projection: { name: 1, gender: 1, phone: 1, pan: 1, dob: 1, employment: 1, income: 1, pincode: 1, city: 1, state: 1, email: 1, cibil: 1 } }).toArray();
     logger.info(`📊 Total Unprocessed Leads Found: ${leads.length}`);
 
     let totalProcessedOverall = 0;
