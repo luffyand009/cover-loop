@@ -11,11 +11,11 @@ const DB_NAME = process.env.DB_NAME || 'coverloop';
 const LEAD_COLLECTION = process.env.LEAD_COLLECTION || 'keshvadb';
 const RESPONSE_COLLECTION = process.env.RESPONSE_COLLECTION || 'loandidd';
 
-const LOANDIDI_API_KEY = process.env.LOANDIDI_API_KEY || 'ldk_test_IFPFZ0VF8Bg5X15SsAC82dsB32HXkJBc6_2y1J3SKKs';
+const LOANDIDI_API_KEY = process.env.LOANDIDI_API_KEY || 'ldk_live_NKYavhxhqt9Y9l6O0lLqfwHcMYjbnxlLMt2iyqMdPAU';
 const BASE_URL = 'https://api.loandidi.com/api/method';
 
 // 50 का बैच और 3.5s डिले (LoanDidi की 1000 leads/min लिमिट के अंदर एकदम सेफ)
-const BATCH_SIZE = 50;
+const BATCH_SIZE = 10;
 const DELAY_BETWEEN_BATCHES_MS = 3500;
 
 // आज का टारगेट (CLI arg से या Env से, डिफ़ॉल्ट 1000)
