@@ -20,14 +20,14 @@ const API_KEY = process.env.MONEYJENIE_API_KEY || "de7959cd67ef1f9a7a886c74eb5b5
 const MONGO_URI = process.env.MONGO_URI_COVER;
 const DB_NAME = "coverloop";
 
-const LEAD_COLLECTION = "sm";
+const LEAD_COLLECTION = "payme";
 const RESPONSE_COLLECTION = "moneyjenie";
 const LENDER_NAME = "moneyjenie";
 
 // Exact path for xlsx folder inside your project directory
 const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "moneyjennie.xlsx");
 
-const BATCH_SIZE = 100;
+const BATCH_SIZE = 1000;
 const MAX_THREADS = 5;
 const MAX_RETRIES = 3;
 const RETRY_BACKOFF = 1.5;
