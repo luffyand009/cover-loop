@@ -14,11 +14,9 @@ const RESPONSE_COLLECTION = process.env.RESPONSE_COLLECTION || 'loandidd';
 const LOANDIDI_API_KEY = process.env.LOANDIDI_API_KEY || 'ldk_live_NKYavhxhqt9Y9l6O0lLqfwHcMYjbnxlLMt2iyqMdPAU';
 const BASE_URL = 'https://api.loandidi.com/api/method';
 
-// 50 का बैच और 3.5s डिले (LoanDidi की 1000 leads/min लिमिट के अंदर एकदम सेफ)
 const BATCH_SIZE = 10;
 const DELAY_BETWEEN_BATCHES_MS = 3500;
 
-// आज का टारगेट (CLI arg से या Env से, डिफ़ॉल्ट 1000)
 const DAILY_LIMIT = parseInt(process.argv[2] || process.env.DAILY_LIMIT || '1000', 10);
 
 // ==========================================
@@ -34,6 +32,19 @@ const apiClient = axios.create({
 });
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+// Helper: Convert DD-MM-YYYY to YYYY-MM-DD if needed by API
+function formatDate(dobStr) {
+  if (!dobStr) return '1995-01-01';
+  // If already YYYY-MM-DD
+  if (/^\d{4}-\d{2}-\d{2}$/.test(dobStr)) return dobStr;
+  // If DD-MM-YYYY or DD/MM/YYYY
+  const parts = dobStr.split(/[-/]/);
+  if (parts.length === 3 && parts[0].length === 2) {
+    return `${parts[2]}-${parts[1]}-${parts[0]}`;
+  }
+  return dobStr;
+}
 
 // ==========================================
 // 3. MAIN BATCH SYNC ENGINE
@@ -57,7 +68,6 @@ async function startWorker() {
     const leadsCollection = db.collection(LEAD_COLLECTION);
     const responseCollection = db.collection(RESPONSE_COLLECTION);
 
-    // इंडेक्स बनाएं ताकि परफॉरमेंस फ़ास्ट रहे
     await leadsCollection.createIndex({ loanDidiStatus: 1, createdAt: 1 });
 
     let totalSyncedToday = 0;
@@ -66,7 +76,6 @@ async function startWorker() {
       const remainingQuota = DAILY_LIMIT - totalSyncedToday;
       const currentBatchLimit = Math.min(BATCH_SIZE, remainingQuota);
 
-      // 1. DB से पेंडिंग यूज़र्स उठाएँ (जिनका स्टेटस PENDING, null या FAILED है)
       const users = await leadsCollection
         .find({ loanDidiStatus: { $in: [null, 'PENDING', 'FAILED'] } })
         .sort({ createdAt: 1 })
@@ -80,24 +89,28 @@ async function startWorker() {
 
       console.log(`⏳ Processing batch of ${users.length} leads (Total Sent: ${totalSyncedToday}/${DAILY_LIMIT})...`);
 
-      // 2. आपके डेटाबेस फ़ील्ड्स के हिसाब से LoanDidi पेलोड तैयार करें
+      // 2. Updated Payload with missing fields (employment, gender, format dob)
       const leadsPayload = users.map((u) => ({
         partnerReference: `CM_${u._id}`,
         name: u.name,
-        mobile: u.phone, // आपके डेटाबेस में 'phone' फ़ील्ड है[cite: 1]
+        mobile: u.phone,
         email: u.email || 'support@covermantra.in',
         pan: u.pan,
-        dob: u.dob || '1995-01-01',
-        monthly_income: Number(u.income) || 25000, // आपके डेटाबेस में 'income' फ़ील्ड है[cite: 1]
-        loan_amount: u.loanAmount || 50000, // अगर डेटाबेस में नहीं है तो डिफ़ॉल्ट 50000
+        dob: formatDate(u.dob),
+        monthly_income: Number(u.income) || 25000,
+        loan_amount: u.loanAmount || 50000,
         pincode: String(u.pincode || '110001'),
+        
+        // Added missing fields from your DB schema:
+        employment: u.employment ? u.employment.toLowerCase() : 'salaried',
+        gender: u.gender ? u.gender.toUpperCase() : 'FEMALE',
+
         consent: true,
         consentChannel: 'website',
         consentText: 'I agree to share my details with LoanDidi for my loan application.'
       }));
 
       try {
-        // 3. बल्क API कॉल (/partner.v1.leads.bulk)
         const response = await apiClient.post('/partner.v1.leads.bulk', {
           leads: leadsPayload
         });
@@ -159,7 +172,6 @@ async function startWorker() {
           }
         });
 
-        // 4. DB अपडेट करें
         if (bulkLeadOps.length > 0) {
           await leadsCollection.bulkWrite(bulkLeadOps);
         }
@@ -175,7 +187,6 @@ async function startWorker() {
           break;
         }
 
-        // 5. रेट लिमिटिंग डिले
         await sleep(DELAY_BETWEEN_BATCHES_MS);
 
       } catch (err) {
@@ -188,7 +199,6 @@ async function startWorker() {
         } else {
           console.error('❌ Batch API Failed:', err.response?.data || err.message);
           
-          // अगर API फेल हो जाए तो इस बैच के रिकॉर्ड्स को FAILED मार्क करें
           const failOps = users.map((u) => ({
             updateOne: {
               filter: { _id: u._id },
