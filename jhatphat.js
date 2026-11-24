@@ -14,7 +14,7 @@ const BASE_URL = 'https://apilm.jhatpatcash.com/api/v1/marketplace/covermantra';
 const AUTH_HEADER = 'cGtfMkQ0QkZBQzA2MUQwRUEwMUI1NTA0NjBFQjg5NUIxQTQ6c2tfMjNhYzBiZjI4OTEzYmMzZGY0OTliMjcxYzlhNGE2YTg5NWE3MmI2OTNhZTk1ZDI4NTkyNDA4ZWIwNWQ1MTdjZA==';
 const LENDER_NAME = "covermantra_marketplace";
 
-const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "jhatphat.xlsx");
+const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "jhatphat1.xlsx");
 
 const REQUEST_TIMEOUT = 15000;
 const MAX_SUCCESS_LIMIT = 10; // Sirf 10 successful leads ke baad ruk jayega
