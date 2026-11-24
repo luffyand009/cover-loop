@@ -28,13 +28,13 @@ function loadValidPincodes() {
     const workbook = XLSX.readFile(PINCODE_FILE_PATH);
     const sheetName = workbook.SheetNames[0];
     const worksheet = workbook.Sheets[sheetName];
-    
+
     const data = XLSX.utils.sheet_to_json(worksheet);
     const pincodes = new Set();
-    
+
     data.forEach((row) => {
       const pinKey = Object.keys(row).find(
-        (key) => key.trim().toLowerCase() === 'pincode' || key.trim().toLowerCase() === 'pin'
+        (key) => key.trim().toLowerCase() === "pincode" || key.trim().toLowerCase() === "pin"
       );
 
       if (pinKey && row[pinKey]) {
@@ -55,11 +55,16 @@ function loadValidPincodes() {
 
 const allowedPincodes = loadValidPincodes();
 
-const BATCH_SIZE = 50;       // MongoDB se ek baar mein 50 records uthane hain
-const CONCURRENCY_LIMIT = 10; // 🚀 10 leads ek sath parallel (10 loops)
+// 🐢 Slow & Single-Loop Settings
+const CONCURRENCY_LIMIT = 1; // Sirf 1 lead ek time par
+const DELAY_MS = 1000;       // Har lead ke baad 1 second (1000ms) ka gap
 const REQUEST_TIMEOUT = 30000;
 
-let currentActiveRequests = 0; // Track karega ki kitni APIs exact time par chal rahi hain
+let currentActiveRequests = 0;
+
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
 
 function log(level, message) {
   console.log(`${new Date().toISOString()} [${level}] ${message}`);
@@ -132,14 +137,14 @@ function shouldSkip(lead) {
 async function processLead(item, leadCol, responseCol) {
   currentActiveRequests++;
   const mobile = item.phone || item.mobile || item.contact || "";
-  log("INFO", `🟢 [START] Lead: ${mobile} | Current Active Requests: ${currentActiveRequests}`);
+  log("INFO", `🟢 [START] Lead: ${mobile} | Active Requests: ${currentActiveRequests}`);
 
   const skipReason = shouldSkip(item);
   if (skipReason) {
     log("WARN", `Skipped lead ${mobile} due to: ${skipReason}`);
     if (item._id) {
       await leadCol.updateOne(
-        { _id: item._id }, 
+        { _id: item._id },
         { $addToSet: { processed: `${LENDER_NAME}: skipped_${skipReason}` } }
       );
     }
@@ -166,18 +171,18 @@ async function processLead(item, leadCol, responseCol) {
     const duplicateData = duplicateRes.data || {};
     const canProceed = duplicateData?.duplicateStatusCode === 1;
 
-    let casheResponseObj = { DuplicateCheck: duplicateData };
+    const casheResponseObj = { DuplicateCheck: duplicateData };
 
     if (!canProceed) {
       log("WARN", `Lead not eligible or duplicate status code for ${mobile}`);
-      
+
       await responseCol.insertOne({
         phone: mobile,
         name: item.name || "",
         pan: item.pan || "",
         status: "NOT_ELIGIBLE_OR_DUPLICATE",
         api_response: casheResponseObj,
-        createdAt: new Date().toISOString().slice(0, 10)
+        createdAt: new Date().toISOString().slice(0, 10),
       });
 
       await leadCol.updateOne(
@@ -189,11 +194,11 @@ async function processLead(item, leadCol, responseCol) {
       return false;
     }
 
-    // 2. Create Customer API 
+    // 2. Create Customer API
     const { firstName, lastName } = parseName(item.name);
     const formattedDob = formatDOBCasheDDMMYYYY(item.dob);
     const loanAmt = String(item.loanAmount || 50000);
-    
+
     // Fallback 12-digit string agar database mein aadhaar nahi hai
     const userAadhaar = String(item.aadhaar || "123456789012");
 
@@ -276,7 +281,9 @@ async function processLead(item, leadCol, responseCol) {
         name: `${firstName} ${lastName}`,
         dob: formattedDob,
         gender: formatGenderShort(item.gender),
-        "compressed-address": String(item.compressedAddress || `${item.address || ""}, ${item.city || ""}\n${item.pincode || ""}`),
+        "compressed-address": String(
+          item.compressedAddress || `${item.address || ""}, ${item.city || ""}\n${item.pincode || ""}`
+        ),
       },
     };
 
@@ -294,18 +301,17 @@ async function processLead(item, leadCol, responseCol) {
       pan: item.pan || "",
       status: "SUCCESS_PROCESSED",
       api_response: casheResponseObj,
-      createdAt: new Date().toISOString().slice(0, 10)
+      createdAt: new Date().toISOString().slice(0, 10),
     });
 
     await leadCol.updateOne(
-      { _id: item._id }, 
+      { _id: item._id },
       { $addToSet: { processed: `${LENDER_NAME}: SUCCESS` } }
     );
-    
+
     currentActiveRequests--;
     log("INFO", `🔴 [END-SUCCESS] Lead: ${mobile} | Active Requests: ${currentActiveRequests}`);
     return true;
-
   } catch (err) {
     const errData = err.response?.data || err.message;
     log("ERROR", `API Error for lead ${mobile}: ${JSON.stringify(errData)}`);
@@ -316,48 +322,17 @@ async function processLead(item, leadCol, responseCol) {
       pan: item.pan || "",
       status: "FAILED_ERROR",
       api_response: { error: errData },
-      createdAt: new Date().toISOString().slice(0, 10)
+      createdAt: new Date().toISOString().slice(0, 10),
     });
 
     await leadCol.updateOne(
-      { _id: item._id }, 
+      { _id: item._id },
       { $addToSet: { processed: `${LENDER_NAME}: ERROR` } }
     );
     currentActiveRequests--;
     log("INFO", `🔴 [END-ERROR] Lead: ${mobile} | Active Requests: ${currentActiveRequests}`);
     return false;
   }
-}
-
-// Helper: Array ko chhote chunks mein todne ke liye
-function chunkArray(array, size) {
-  const chunks = [];
-  for (let i = 0; i < array.length; i += size) {
-    chunks.push(array.slice(i, i + size));
-  }
-  return chunks;
-}
-
-// Helper: Chunks ko parallel chalane ke liye (10 at a time)
-async function processBatchConcurrently(batchLeads, leadCol, responseCol, concurrencyLimit) {
-  const chunks = chunkArray(batchLeads, concurrencyLimit);
-  let processedCount = 0;
-
-  for (const chunk of chunks) {
-    const results = await Promise.all(
-      chunk.map(async (item) => {
-        return await processLead(item, leadCol, responseCol);
-      })
-    );
-
-    results.forEach(success => {
-      if (success) processedCount++;
-    });
-
-    await new Promise(r => setTimeout(r, 50));
-  }
-
-  return processedCount;
 }
 
 async function main() {
@@ -374,7 +349,7 @@ async function main() {
   const client = new MongoClient(MONGO_URI);
   try {
     await client.connect();
-    log("INFO", "✅ MongoDB Connected Successfully");
+    log("INFO", `✅ MongoDB Connected Successfully | Mode: Sequential (1 loop, delay ${DELAY_MS}ms)`);
     const db = client.db(DB_NAME);
     const leadCol = db.collection(LEAD_COLLECTION);
     const responseCol = db.collection(RESPONSE_COLLECTION);
@@ -382,30 +357,25 @@ async function main() {
     const query = {
       $or: [
         { processed: { $exists: false } },
-        { processed: { $not: { $regex: new RegExp(LENDER_NAME, "i") } } }
-      ]
+        { processed: { $not: { $regex: new RegExp(LENDER_NAME, "i") } } },
+      ],
     };
 
     const cursor = leadCol.find(query);
-    let total = 0, processed = 0;
-    let batch = [];
+    let total = 0;
+    let processed = 0;
 
+    // Sirf ek hi loop: ek-ek lead aayegi aur complete hone ke baad agli chalegi
     for await (const lead of cursor) {
       total++;
-      batch.push(lead);
-
-      if (batch.length === BATCH_SIZE) {
-        log("INFO", `🚀 Processing batch of ${batch.length} leads with concurrency limit ${CONCURRENCY_LIMIT}...`);
-        const count = await processBatchConcurrently(batch, leadCol, responseCol, CONCURRENCY_LIMIT);
-        processed += count;
-        batch = [];
+      const success = await processLead(lead, leadCol, responseCol);
+      if (success) {
+        processed++;
       }
-    }
 
-    if (batch.length > 0) {
-      log("INFO", `🚀 Processing final batch of ${batch.length} leads...`);
-      const count = await processBatchConcurrently(batch, leadCol, responseCol, CONCURRENCY_LIMIT);
-      processed += count;
+      if (DELAY_MS > 0) {
+        await sleep(DELAY_MS);
+      }
     }
 
     log("INFO", `----- SUMMARY -----\nTOTAL FETCHED: ${total}\nPROCESSED: ${processed}`);
