@@ -100,7 +100,7 @@ async function startWorker() {
         monthly_income: Number(u.income) || 25000,
         loan_amount: u.loanAmount || 50000,
         pincode: String(u.pincode || '110001'),
-        
+
         // Added missing fields from your DB schema:
         employment: u.employment ? u.employment.toLowerCase() : 'salaried',
         gender: u.gender ? u.gender.toUpperCase() : 'FEMALE',
@@ -116,13 +116,19 @@ async function startWorker() {
         });
 
         const results = response.data?.results || response.data?.leads || [];
-        
+
         const bulkLeadOps = [];
         const responseLogs = [];
 
         users.forEach((user, idx) => {
           const res = results[idx] || null;
           const now = new Date();
+          const userMeta = {
+            userId: user._id,
+            name: user.name || '',
+            phone: user.phone || '',
+            pan: user.pan || ''
+          };
 
           if (res && res.lead) {
             bulkLeadOps.push({
@@ -141,7 +147,7 @@ async function startWorker() {
             });
 
             responseLogs.push({
-              userId: user._id,
+              ...userMeta,
               leadId: res.lead,
               status: 'SUCCESS',
               response: res,
@@ -163,7 +169,7 @@ async function startWorker() {
             });
 
             responseLogs.push({
-              userId: user._id,
+              ...userMeta,
               status: 'FAILED',
               error: errorMsg,
               response: res,
@@ -198,7 +204,7 @@ async function startWorker() {
           await sleep(retryAfter * 1000);
         } else {
           console.error('❌ Batch API Failed:', err.response?.data || err.message);
-          
+
           const failOps = users.map((u) => ({
             updateOne: {
               filter: { _id: u._id },
