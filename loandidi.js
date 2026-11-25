@@ -19,7 +19,7 @@ const BASE_URL = 'https://api.loandidi.com/api/method';
 const PINCODE_FILE_PATH = process.env.PINCODE_FILE_PATH || path.join(__dirname, 'xlsx', 'LoanDidi Pincodes.xlsx');
 
 // Hard API limit: max 100 leads per bulk request & 256 KB payload limit
-const MAX_API_BATCH_SIZE = 100;
+const MAX_API_BATCH_SIZE = 10;
 const BATCH_SIZE = Math.min(parseInt(process.env.BATCH_SIZE || '100', 10), MAX_API_BATCH_SIZE);
 const DELAY_BETWEEN_BATCHES_MS = 3500;
 const MAX_CONSECUTIVE_FAILURES = 3;
