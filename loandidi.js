@@ -10,7 +10,7 @@ const XLSX = require('xlsx');
 const MONGO_URI = process.env.MONGO_URI_COVER || process.env.MONGO_URI || 'mongodb://localhost:27017';
 const DB_NAME = process.env.DB_NAME || 'coverloop';
 
-const LEAD_COLLECTION = process.env.LEAD_COLLECTION || 'keshvadb';
+const LEAD_COLLECTION = process.env.LEAD_COLLECTION || 'vishal';
 const RESPONSE_COLLECTION = process.env.RESPONSE_COLLECTION || 'loandidd';
 
 const LOANDIDI_API_KEY = process.env.LOANDIDI_API_KEY || 'ldk_live_NKYavhxhqt9Y9l6O0lLqfwHcMYjbnxlLMt2iyqMdPAU';

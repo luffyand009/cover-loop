@@ -17,7 +17,7 @@ const LENDER_NAME = "covermantra_marketplace";
 const PINCODE_FILE_PATH = path.join(__dirname, "xlsx", "jhatphat1.xlsx");
 
 const REQUEST_TIMEOUT = 15000;
-const MAX_SUCCESS_LIMIT = 10; // Sirf 10 successful leads ke baad ruk jayega
+const MAX_SUCCESS_LIMIT = 1000; // Sirf 10 successful leads ke baad ruk jayega
 
 // Excel se Pincode Load karne ka function
 function loadValidPincodes() {
