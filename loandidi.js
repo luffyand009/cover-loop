@@ -18,7 +18,8 @@ const BASE_URL = 'https://api.loandidi.com/api/method';
 
 const PINCODE_FILE_PATH = process.env.PINCODE_FILE_PATH || path.join(__dirname, 'xlsx', 'LoanDidi Pincodes.xlsx');
 
-const BATCH_SIZE = 1000;
+// Keep at 500 so JSON payload stays well below the 256 KB API limit
+const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '500', 10);
 const DELAY_BETWEEN_BATCHES_MS = 3500;
 
 const DAILY_LIMIT = parseInt(process.argv[2] || process.env.DAILY_LIMIT || '1000', 10);
@@ -123,7 +124,6 @@ async function startWorker() {
       const remainingQuota = DAILY_LIMIT - totalSyncedToday;
       const currentBatchLimit = Math.min(BATCH_SIZE, remainingQuota);
 
-      // Thoda zyada fetch karte hain taaki skipped pincodes ke baad bhi eligible leads mil sakein
       const candidateUsers = await leadsCollection
         .find({ loanDidiStatus: { $in: [null, 'PENDING', 'FAILED'] } })
         .sort({ createdAt: 1 })
@@ -184,13 +184,10 @@ async function startWorker() {
         monthly_income: Number(u.income) || 25000,
         loan_amount: u.loanAmount || 50000,
         pincode: String(u.pincode).trim(),
-
         employment: u.employment ? u.employment.toLowerCase() : 'salaried',
         gender: u.gender ? u.gender.toUpperCase() : 'FEMALE',
-
         consent: true,
-        consentChannel: 'website',
-        consentText: 'I agree to share my details with LoanDidi for my loan application.'
+        consentChannel: 'website'
       }));
 
       try {
@@ -203,6 +200,7 @@ async function startWorker() {
         const bulkLeadOps = [];
         const responseLogs = [];
         const todayStr = getTodayDateString();
+        let batchAcceptedCount = 0;
 
         eligibleUsers.forEach((user, idx) => {
           const res = results[idx] || null;
@@ -215,6 +213,7 @@ async function startWorker() {
           };
 
           if (res && res.lead) {
+            batchAcceptedCount++;
             bulkLeadOps.push({
               updateOne: {
                 filter: { _id: user._id },
@@ -270,15 +269,14 @@ async function startWorker() {
           await responseCollection.insertMany(responseLogs);
         }
 
-        totalSyncedToday += eligibleUsers.length;
-        console.log(`✅ Batch complete! Progress: ${totalSyncedToday}/${DAILY_LIMIT}`);
+        totalSyncedToday += batchAcceptedCount;
+        console.log(`✅ Batch complete! Accepted: ${batchAcceptedCount}/${eligibleUsers.length} | Progress: ${totalSyncedToday}/${DAILY_LIMIT}`);
 
         if (totalSyncedToday >= DAILY_LIMIT) {
           break;
         }
 
         await sleep(DELAY_BETWEEN_BATCHES_MS);
-
       } catch (err) {
         const status = err.response?.status;
         const retryAfter = parseInt(err.response?.headers['retry-after'] || '10', 10);
@@ -312,7 +310,7 @@ async function startWorker() {
       }
     }
 
-    console.log(`\n🎉 Goal Finished! Total ${totalSyncedToday} leads sent today (Skipped by pincode: ${totalSkippedPincode}).`);
+    console.log(`\n🎉 Goal Finished! Total ${totalSyncedToday} leads accepted today (Skipped by pincode: ${totalSkippedPincode}).`);
   } catch (fatalErr) {
     console.error('💥 Fatal Worker Error:', fatalErr);
   } finally {
