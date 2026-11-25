@@ -18,9 +18,11 @@ const BASE_URL = 'https://api.loandidi.com/api/method';
 
 const PINCODE_FILE_PATH = process.env.PINCODE_FILE_PATH || path.join(__dirname, 'xlsx', 'LoanDidi Pincodes.xlsx');
 
-// Keep at 500 so JSON payload stays well below the 256 KB API limit
-const BATCH_SIZE = parseInt(process.env.BATCH_SIZE || '500', 10);
+// Hard API limit: max 100 leads per bulk request & 256 KB payload limit
+const MAX_API_BATCH_SIZE = 100;
+const BATCH_SIZE = Math.min(parseInt(process.env.BATCH_SIZE || '100', 10), MAX_API_BATCH_SIZE);
 const DELAY_BETWEEN_BATCHES_MS = 3500;
+const MAX_CONSECUTIVE_FAILURES = 3;
 
 const DAILY_LIMIT = parseInt(process.argv[2] || process.env.DAILY_LIMIT || '1000', 10);
 
@@ -94,7 +96,7 @@ async function startWorker() {
   console.log(`====================================================`);
   console.log(`🚀 LoanDidi Bulk Lead Sync Worker Initiated`);
   console.log(`🎯 Today's Quota: ${DAILY_LIMIT} leads`);
-  console.log(`📦 Batch Size: ${BATCH_SIZE} leads/batch`);
+  console.log(`📦 Batch Size: ${BATCH_SIZE} leads/batch (API Max: 100)`);
   console.log(`📍 Allowed Pincodes: ${allowedPincodes.size}`);
   console.log(`📂 Database: ${DB_NAME} | Collection: ${LEAD_COLLECTION}`);
   console.log(`====================================================\n`);
@@ -116,9 +118,18 @@ async function startWorker() {
     const responseCollection = db.collection(RESPONSE_COLLECTION);
 
     await leadsCollection.createIndex({ loanDidiStatus: 1, createdAt: 1 });
+    await responseCollection.createIndex({ createdAt: 1, status: 1 });
 
-    let totalSyncedToday = 0;
+    const todayStr = getTodayDateString();
+    let totalSyncedToday = await responseCollection.countDocuments({
+      createdAt: todayStr,
+      status: 'SUCCESS'
+    });
+
+    console.log(`📊 Already accepted today (${todayStr}): ${totalSyncedToday}/${DAILY_LIMIT}`);
+
     let totalSkippedPincode = 0;
+    let consecutiveFailures = 0;
 
     while (totalSyncedToday < DAILY_LIMIT) {
       const remainingQuota = DAILY_LIMIT - totalSyncedToday;
@@ -127,7 +138,7 @@ async function startWorker() {
       const candidateUsers = await leadsCollection
         .find({ loanDidiStatus: { $in: [null, 'PENDING', 'FAILED'] } })
         .sort({ createdAt: 1 })
-        .limit(currentBatchLimit * 3)
+        .limit(currentBatchLimit * 4)
         .toArray();
 
       if (!candidateUsers || candidateUsers.length === 0) {
@@ -172,7 +183,7 @@ async function startWorker() {
         continue;
       }
 
-      console.log(`⏳ Processing batch of ${eligibleUsers.length} eligible leads (Total Sent: ${totalSyncedToday}/${DAILY_LIMIT})...`);
+      console.log(`⏳ Sending batch of ${eligibleUsers.length} eligible leads (Accepted Today: ${totalSyncedToday}/${DAILY_LIMIT})...`);
 
       const leadsPayload = eligibleUsers.map((u) => ({
         partnerReference: `CM_${u._id}`,
@@ -187,7 +198,8 @@ async function startWorker() {
         employment: u.employment ? u.employment.toLowerCase() : 'salaried',
         gender: u.gender ? u.gender.toUpperCase() : 'FEMALE',
         consent: true,
-        consentChannel: 'website'
+        consentChannel: 'website',
+        consentText: 'I agree to share my details with LoanDidi for my loan application.'
       }));
 
       try {
@@ -195,11 +207,13 @@ async function startWorker() {
           leads: leadsPayload
         });
 
+        // Reset failure counter on a valid HTTP response
+        consecutiveFailures = 0;
+
         const results = response.data?.results || response.data?.leads || [];
 
         const bulkLeadOps = [];
         const responseLogs = [];
-        const todayStr = getTodayDateString();
         let batchAcceptedCount = 0;
 
         eligibleUsers.forEach((user, idx) => {
@@ -243,7 +257,7 @@ async function startWorker() {
                 filter: { _id: user._id },
                 update: {
                   $set: {
-                    loanDidiStatus: 'FAILED',
+                    loanDidiStatus: 'REJECTED_LEAD',
                     loanDidiError: errorMsg,
                     syncedAt: now
                   }
@@ -279,38 +293,37 @@ async function startWorker() {
         await sleep(DELAY_BETWEEN_BATCHES_MS);
       } catch (err) {
         const status = err.response?.status;
-        const retryAfter = parseInt(err.response?.headers['retry-after'] || '10', 10);
+        const errData = err.response?.data || err.message;
+        const retryAfter = parseInt(err.response?.headers['retry-after'] || '15', 10);
 
+        // 1. Rate Limit / Temporary Server Overload -> Back off
         if (status === 429 || status === 503) {
           console.warn(`⚠️ Rate Limit / Server Busy (${status}). Backing off for ${retryAfter}s...`);
           await sleep(retryAfter * 1000);
-        } else {
-          console.error('❌ Batch API Failed:', err.response?.data || err.message);
-
-          const failOps = eligibleUsers.map((u) => ({
-            updateOne: {
-              filter: { _id: u._id },
-              update: {
-                $set: {
-                  loanDidiStatus: 'FAILED',
-                  loanDidiError: err.response?.data?.error?.message || err.message,
-                  syncedAt: new Date()
-                }
-              }
-            }
-          }));
-
-          if (failOps.length > 0) {
-            await leadsCollection.bulkWrite(failOps);
-          }
-
-          console.log('⏳ Pausing 5s before next batch...');
-          await sleep(5000);
+          continue;
         }
+
+        // 2. Client / Request Format / Auth Errors (400, 401, 403, 413, 422) -> Stop immediately!
+        if (status && status >= 400 && status < 500) {
+          console.error(`🛑 Fatal API Request Error (${status}). Stopping worker to avoid retry spam:`, errData);
+          break;
+        }
+
+        // 3. Network / 5xx Server Errors -> Retry up to MAX_CONSECUTIVE_FAILURES times, then stop
+        consecutiveFailures++;
+        console.error(`❌ Batch API Failed (${consecutiveFailures}/${MAX_CONSECUTIVE_FAILURES}):`, errData);
+
+        if (consecutiveFailures >= MAX_CONSECUTIVE_FAILURES) {
+          console.error(`🛑 Reached ${MAX_CONSECUTIVE_FAILURES} consecutive failures. Stopping worker.`);
+          break;
+        }
+
+        console.log('⏳ Pausing 10s before next attempt...');
+        await sleep(10000);
       }
     }
 
-    console.log(`\n🎉 Goal Finished! Total ${totalSyncedToday} leads accepted today (Skipped by pincode: ${totalSkippedPincode}).`);
+    console.log(`\n🎉 Worker Finished! Total accepted today: ${totalSyncedToday}/${DAILY_LIMIT} (Skipped by pincode: ${totalSkippedPincode}).`);
   } catch (fatalErr) {
     console.error('💥 Fatal Worker Error:', fatalErr);
   } finally {
