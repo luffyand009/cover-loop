@@ -1,6 +1,8 @@
 require('dotenv').config();
 const { MongoClient } = require('mongodb');
 const axios = require('axios');
+const path = require('path');
+const XLSX = require('xlsx');
 
 // ==========================================
 // 1. CONFIGURATION & CONSTANTS
@@ -13,6 +15,23 @@ const DB_NAME = process.env.DB_NAME || 'coverloop';
 const LEAD_COLLECTION = process.env.LEAD_COLLECTION || 'keshvadb';
 const RESPONSE_COLLECTION =
   process.env.MONEYBRO_RESPONSE_COLLECTION || 'moneybro_responses';
+
+// Excel / XLS Pincode File Config
+const PINCODE_EXCEL_PATH =
+  process.env.PINCODE_EXCEL_PATH || path.join(__dirname, 'moneybro.xlsx');
+const PINCODE_SHEET_NAME = process.env.PINCODE_SHEET_NAME || '';
+const PINCODE_COLUMN_NAME = process.env.PINCODE_COLUMN_NAME || 'pincode';
+
+// Fallback Pincode List (agar Excel file na ho ya khali ho)
+const ALLOWED_PINCODES = [
+  // '110001',
+  // '831004',
+];
+
+// Eligibility Filters
+const MIN_INCOME = Number(process.env.MIN_INCOME || 20000);
+const MIN_AGE = Number(process.env.MIN_AGE || 21);
+const MAX_AGE = Number(process.env.MAX_AGE || 55);
 
 const CONFIG = {
   baseUrl: process.env.MONEYBRO_BASE_URL || 'https://web.moneybro.in/cloudbankin/api/v1',
@@ -41,6 +60,7 @@ const CONFIG = {
 let authToken = null;
 let cachedFormMeta = null;
 let isShuttingDown = false;
+let allowedPincodeSet = new Set();
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -53,15 +73,165 @@ const apiClient = axios.create({
   timeout: 30000,
 });
 
-function formatDate(dobStr) {
-  if (!dobStr) return '1995-01-01';
-  const clean = String(dobStr).trim();
-  if (/^\d{4}-\d{2}-\d{2}$/.test(clean)) return clean;
-  const parts = clean.split(/[-/]/);
-  if (parts.length === 3 && parts[0].length === 2 && parts[2].length === 4) {
-    return `${parts[2]}-${parts[1].padStart(2, '0')}-${parts[0].padStart(2, '0')}`;
+function loadPincodesFromExcel() {
+  const pincodes = new Set();
+
+  try {
+    const workbook = XLSX.readFile(PINCODE_EXCEL_PATH);
+    const sheetName = PINCODE_SHEET_NAME || workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+
+    if (sheet) {
+      const rows = XLSX.utils.sheet_to_json(sheet, { defval: '' });
+      const targetColLower = PINCODE_COLUMN_NAME.trim().toLowerCase();
+
+      for (const row of rows) {
+        let rawPin = '';
+
+        // Exact or case-insensitive column match
+        for (const [key, val] of Object.entries(row)) {
+          if (String(key).trim().toLowerCase() === targetColLower) {
+            rawPin = val;
+            break;
+          }
+        }
+
+        // Agar column name match na ho to pehli column ki value le lo
+        if (!rawPin) {
+          const firstVal = Object.values(row)[0];
+          rawPin = firstVal;
+        }
+
+        const cleaned = String(rawPin || '').replace(/\D/g, '').trim();
+        if (/^\d{6}$/.test(cleaned)) {
+          pincodes.add(cleaned);
+        }
+      }
+    }
+
+    if (pincodes.size > 0) {
+      console.log(`📍 Loaded ${pincodes.size} pincodes from Excel: ${PINCODE_EXCEL_PATH}`);
+      return pincodes;
+    }
+  } catch (err) {
+    console.warn(`⚠️ Could not read Excel pincodes (${PINCODE_EXCEL_PATH}): ${err.message}`);
   }
-  return clean;
+
+  for (const p of ALLOWED_PINCODES) {
+    const cleaned = String(p).replace(/\D/g, '').trim();
+    if (/^\d{6}$/.test(cleaned)) {
+      pincodes.add(cleaned);
+    }
+  }
+
+  if (pincodes.size > 0) {
+    console.log(`📍 Using ${pincodes.size} fallback pincodes from ALLOWED_PINCODES.`);
+  } else {
+    console.log('📍 No pincode filter active (ALL pincodes allowed).');
+  }
+
+  return pincodes;
+}
+
+function parseDobDate(dobStr) {
+  if (!dobStr) return null;
+  const clean = String(dobStr).trim();
+
+  let match = clean.match(/^(\d{4})[-/](\d{1,2})[-/](\d{1,2})$/);
+  if (match) {
+    return new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3])));
+  }
+
+  match = clean.match(/^(\d{1,2})[-/](\d{1,2})[-/](\d{4})$/);
+  if (match) {
+    return new Date(Date.UTC(Number(match[3]), Number(match[2]) - 1, Number(match[1])));
+  }
+
+  const parsed = new Date(clean);
+  return Number.isNaN(parsed.getTime()) ? null : parsed;
+}
+
+function formatDate(dobStr) {
+  const dt = parseDobDate(dobStr);
+  if (!dt) return '1995-01-01';
+  const yyyy = dt.getUTCFullYear();
+  const mm = String(dt.getUTCMonth() + 1).padStart(2, '0');
+  const dd = String(dt.getUTCDate()).padStart(2, '0');
+  return `${yyyy}-${mm}-${dd}`;
+}
+
+function calculateAge(dobStr, refDate = new Date()) {
+  const dob = parseDobDate(dobStr);
+  if (!dob) return null;
+
+  let age = refDate.getUTCFullYear() - dob.getUTCFullYear();
+  const monthDiff = refDate.getUTCMonth() - dob.getUTCMonth();
+  if (monthDiff < 0 || (monthDiff === 0 && refDate.getUTCDate() < dob.getUTCDate())) {
+    age--;
+  }
+  return age;
+}
+
+function isLeadEligible(doc) {
+  const emp = String(doc.employment || '').trim().toLowerCase();
+  if (emp !== 'salaried') return false;
+
+  const numericIncome = Number(String(doc.income ?? '').replace(/[^0-9.]/g, ''));
+  if (!Number.isFinite(numericIncome) || numericIncome < MIN_INCOME) return false;
+
+  const age = calculateAge(doc.dob);
+  if (age === null || age < MIN_AGE || age > MAX_AGE) return false;
+
+  if (allowedPincodeSet.size > 0) {
+    const pin = String(doc.pincode || '').replace(/\D/g, '').trim();
+    if (!allowedPincodeSet.has(pin)) return false;
+  }
+
+  return true;
+}
+
+function buildPendingQuery() {
+  const conditions = [
+    {
+      $or: [
+        { moneybroStatus: { $exists: false } },
+        { moneybroStatus: null },
+        { moneybroStatus: 'PENDING' },
+      ],
+    },
+    {
+      employment: { $regex: /^salaried$/i },
+    },
+    {
+      $expr: {
+        $gte: [
+          {
+            $convert: {
+              input: {
+                $replaceAll: {
+                  input: { $toString: { $ifNull: ['$income', '0'] } },
+                  find: ',',
+                  replacement: '',
+                },
+              },
+              to: 'double',
+              onError: 0,
+              onNull: 0,
+            },
+          },
+          MIN_INCOME,
+        ],
+      },
+    },
+  ];
+
+  if (allowedPincodeSet.size > 0) {
+    conditions.push({
+      pincode: { $in: Array.from(allowedPincodeSet) },
+    });
+  }
+
+  return { $and: conditions };
 }
 
 async function login() {
@@ -263,9 +433,13 @@ async function saveLead(lead, includeReferralCode = true) {
 // 4. MAIN WORKER LOOP
 // ==========================================
 async function startWorker() {
+  allowedPincodeSet = loadPincodesFromExcel();
+
   console.log('====================================================');
   console.log('🚀 MoneyBro Lead Sync Worker Initiated');
   console.log(`🎯 Today's Quota: ${CONFIG.dailyLimit} leads`);
+  console.log(`💼 Filter: Salaried | Income >= ${MIN_INCOME} | Age ${MIN_AGE}-${MAX_AGE}`);
+  console.log(`📄 Pincode File: ${PINCODE_EXCEL_PATH} (${allowedPincodeSet.size} active pincodes)`);
   console.log(`📂 Database: ${DB_NAME} | Leads: ${LEAD_COLLECTION} | Logs: ${RESPONSE_COLLECTION}`);
   console.log('====================================================\n');
 
@@ -286,18 +460,24 @@ async function startWorker() {
     await login();
     await getFormMetadata();
 
+    const query = buildPendingQuery();
+
     while (!isShuttingDown && totalProcessedToday < CONFIG.dailyLimit) {
-      const limit = Math.min(CONFIG.batchSize, CONFIG.dailyLimit - totalProcessedToday);
-      const pendingLeads = await leadsCollection
-        .find({
-          $or: [{ moneybroStatus: { $exists: false } }, { moneybroStatus: null }, { moneybroStatus: 'PENDING' }],
-        })
+      const remaining = CONFIG.dailyLimit - totalProcessedToday;
+      const fetchLimit = Math.min(CONFIG.batchSize * 2, remaining * 2);
+
+      const candidateLeads = await leadsCollection
+        .find(query)
         .sort({ createdAt: 1 })
-        .limit(limit)
+        .limit(fetchLimit)
         .toArray();
 
+      const pendingLeads = candidateLeads.filter(isLeadEligible).slice(0, remaining);
+
       if (!pendingLeads || pendingLeads.length === 0) {
-        console.log(`[LOOP] Koi pending lead nahi bachi. ${CONFIG.idleWaitMs / 1000}s baad dubara check karega...`);
+        console.log(
+          `[LOOP] Koi eligible pending lead nahi bachi (Salaried, Income >= ${MIN_INCOME}, Age ${MIN_AGE}-${MAX_AGE}). ${CONFIG.idleWaitMs / 1000}s baad check karega...`
+        );
         await sleep(CONFIG.idleWaitMs);
         continue;
       }
