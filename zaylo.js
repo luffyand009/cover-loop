@@ -18,7 +18,7 @@ const RESPONSE_COLLECTION =
 
 // Excel / XLS Pincode File Config
 const PINCODE_EXCEL_PATH =
-  process.env.PINCODE_EXCEL_PATH || path.join(__dirname, "zaylo.xlsx");
+  process.env.PINCODE_EXCEL_PATH || path.join(__dirname, "pincodes.xlsx");
 const PINCODE_SHEET_NAME = process.env.PINCODE_SHEET_NAME || "";
 const PINCODE_COLUMN_NAME = process.env.PINCODE_COLUMN_NAME || "pincode";
 
@@ -27,6 +27,10 @@ const ALLOWED_PINCODES = [
   // "110001",
   // "831004",
 ];
+
+// Dummy / Test Data Blocklist
+const BLOCKED_MOBILES = new Set(["9876543210", "9999999999", "1234567890", "0000000000"]);
+const BLOCKED_PANS = new Set(["ABCDE1234F", "AAAAA0000A", "XXXXX0000X"]);
 
 const BATCH_LIMIT = Number(process.env.BATCH_SIZE || 50);
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS || 60000);
@@ -229,11 +233,17 @@ function calculateAge(rawDob, refDate = new Date()) {
   return age;
 }
 
+function extractFullName(doc) {
+  const direct = String(doc.name || doc.fullName || doc.full_name || "").trim();
+  if (direct) return direct;
+
+  const first = String(doc.first_name || doc.firstName || "").trim();
+  const last = String(doc.last_name || doc.lastName || "").trim();
+  return [first, last].filter(Boolean).join(" ").trim();
+}
+
 function normalizeAndValidateLead(doc) {
-  const fullName = String(doc.name || doc.fullName || doc.full_name || "")
-    .trim()
-    .split(/\s+/)
-    .filter(Boolean);
+  const fullName = extractFullName(doc).split(/\s+/).filter(Boolean);
   const first_name = String(
     doc.first_name || doc.firstName || fullName[0] || ""
   ).trim();
@@ -271,6 +281,10 @@ function normalizeAndValidateLead(doc) {
   const pincode = String(doc.pincode || doc.pinCode || doc.pin || "")
     .replace(/\D/g, "")
     .slice(0, 6);
+
+  if (BLOCKED_MOBILES.has(mobile) || BLOCKED_PANS.has(pan)) {
+    return { valid: false, reason: `Blocked dummy test data (${mobile} / ${pan})` };
+  }
 
   if (!first_name || !last_name) return { valid: false, reason: "Missing name" };
   if (!/^[A-Z]{5}[0-9]{4}[A-Z]$/.test(pan))
@@ -317,6 +331,11 @@ function normalizeAndValidateLead(doc) {
 function buildPendingQuery() {
   const conditions = [
     { "lenders.zaylo.processed": { $ne: true } },
+    {
+      phone: { $nin: Array.from(BLOCKED_MOBILES) },
+      mobile: { $nin: Array.from(BLOCKED_MOBILES) },
+      pan: { $nin: Array.from(BLOCKED_PANS) },
+    },
     {
       $expr: {
         $gte: [
@@ -525,8 +544,9 @@ async function startWorker() {
 
         const doc = pendingLeads[i];
         const mobileLog = doc.mobile || doc.phone || "N/A";
+        const nameLog = extractFullName(doc) || "N/A";
         console.log(
-          `[${i + 1}/${pendingLeads.length}] Processing ID: ${doc._id} | Mobile: ${mobileLog}`
+          `[${i + 1}/${pendingLeads.length}] Processing ID: ${doc._id} | Name: ${nameLog} | Mobile: ${mobileLog}`
         );
 
         try {
@@ -554,6 +574,7 @@ async function startWorker() {
 
           await responseCollection.insertOne({
             userId: doc._id,
+            name: nameLog,
             mobile: mobileLog,
             brand: ZAYLO_CONFIG.BRAND,
             status: result.status,
